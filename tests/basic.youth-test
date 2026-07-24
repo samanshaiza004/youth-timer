@@ -6,6 +6,16 @@
 # guest-side no-op guard on a command whose button is presented disabled.
 # See ../FINDINGS.md for what this test cannot exercise (no real elapsed
 # time passes anywhere here — every tick is an explicit command).
+#
+# NOTE on `activate <name>`: it is direct semantic injection, not simulated
+# user interaction. It bypasses host interaction policy entirely -- enabled-
+# button filtering, focus, and shortcut resolution -- and can target a node
+# whose button is presented disabled. `key <k>` is the command that actually
+# passes through that policy. This test uses `activate` freely for ordinary
+# setup (it is the more direct, less noisy way to drive most of the
+# scenario) and deliberately uses it once, later, specifically *because* it
+# bypasses enabled-button filtering -- to test that the guest itself, not
+# the host, rejects an invalid command. See ../FINDINGS.md, TIMER-F010.
 
 mount
 expect text countdown "00:00"
@@ -53,12 +63,10 @@ activate pause
 expect text mode "Mode: paused"
 expect text countdown "00:09"
 
-# The "advance-1s" button is presented disabled while paused, but the
-# host does not enforce that flag on activation (it is a presentation
-# hint, not access control) -- so this activation reaches the guest.
-# The guest's own model must reject it: advance is a no-op outside
-# Running. This is the guest-side guard the FINDINGS document records
-# as necessary rather than optional.
+# TIMER-F010: `activate` is direct semantic injection (see the file-header
+# note), so this reaches the guest even though "advance-1s" is presented
+# disabled while paused -- the host does not enforce `enabled` here. The
+# guest's own model must reject it: advance is a no-op outside Running.
 activate advance-1s
 expect text mode "Mode: paused"
 expect text countdown "00:09"

@@ -11,34 +11,77 @@ explicit command (`Advance 1s` / `Advance 10s`, or the equivalent test
 activation) standing in for a host clock that does not exist yet. See
 `README.md` for what this means for anyone trying the app.
 
+## The main result
+
+TIMER-F009 means the next round of protocol work can stay narrow:
+
+```text
+Needed:
+  - durable scheduling
+  - host-owned temporal presentation
+  - elapsed delivery
+  - overdue reconciliation
+  - notifications
+
+Not needed:
+  - a redesigned application lifecycle
+  - a general guest clock
+  - raw timer ticks
+  - a new command system
+  - a different persistence API
+```
+
 ## Open findings
 
 | ID | Summary | Next decision |
 | --- | --- | --- |
-| TIMER-F001 | No guest-visible clock; a countdown cannot advance on its own | Requires `youth:time` design and implementation evidence beyond this app |
-| TIMER-F002 | No scheduled wakeup or elapsed-event delivery | Same; the design's "arm a deadline" step has no protocol home today |
-| TIMER-F003 | Remaining duration must be durable guest state, duplicating what a host schedule would own | Resolves automatically once TIMER-F001/F002 are addressed |
+| TIMER-F001 | No host-owned temporal capability; a countdown cannot advance or present without one | Requires declarative scheduling + host-owned presentation design — not a guest-visible clock |
+| TIMER-F002 | No host-initiated application turn | Same; the design's "arm a deadline" step has no protocol home today |
+| TIMER-F003 | Remaining duration must be durable guest state, duplicating what a host schedule would own | Resolves automatically once TIMER-F001/F002 are addressed; deletion path recorded below |
 | TIMER-F004 | Countdown presentation cannot update without invoking the guest | Requires host-owned temporal presentation (the design's countdown node) |
-| TIMER-F006 | No native notification effect on elapse | Deferred until a scheduling capability exists to notify about |
+| TIMER-F005 | Incremental `handle` updates can silently diverge from a fresh `view` | Materially strengthens CALC-F009; justifies building a `--verify-view-convergence` test mode (design recorded below), not yet SDK diffing/reactive dependencies |
+| TIMER-F006 | No native notification effect on elapse | Decision recorded: attach a bounded notification descriptor to the schedule, not a general effects API |
 | TIMER-F007 | No durable schedule or overdue recovery across process exit | Same; `restart` proves app-state persistence, not real-time reconciliation |
-| TIMER-F008 | Generations are expressible as state but stale-delivery is untestable without real scheduling | Becomes testable once a host schedule assigns delivery identity |
+| TIMER-F008 | Generations are expressible as state but stale-delivery is untestable without real scheduling | Schedule generation must be host-issued identity, distinct from any guest session counter |
+| TIMER-F011 | Schedule ownership across app unloading is undefined | Gate B schedule-storage work must decide this before host-initiated delivery is built on top of it |
 
 ## Findings index
 
 | ID | Summary | Status | Primary implication |
 | --- | --- | --- | --- |
-| TIMER-F001 | No guest-visible clock | Open | A countdown can only advance on user or test action |
-| TIMER-F002 | No scheduled wakeup / elapsed delivery | Open | "Start" cannot arm a deadline; only mode changes |
-| TIMER-F003 | Guest must persist remaining duration itself | Open | A second source of truth the host would otherwise own |
+| TIMER-F001 | No host-owned temporal capability | Open | A countdown can only advance on user or test action; resolution is scheduling + presentation, not `now()` |
+| TIMER-F002 | No host-initiated application turn | Open | "Start" cannot arm a deadline; only mode changes |
+| TIMER-F003 | Guest must persist remaining duration itself | Open | A second source of truth the host would otherwise own; deletion path recorded |
 | TIMER-F004 | Countdown cannot self-update | Open | Every visible tick costs a full guest turn |
-| TIMER-F005 | Incremental `handle` updates can silently diverge from a fresh `view` | Addressed in this app; platform risk remains open (tracked by youth's CALC-F009) | Every mode-dependent button `enabled` state must be explicitly reissued on every turn |
-| TIMER-F006 | No native notification effect | Open | Elapse cannot alert the user outside the window |
+| TIMER-F005 | Incremental `handle` updates can silently diverge from a fresh `view` | Addressed in this app; platform risk remains open (tracked by youth's CALC-F009) | Turns theoretical CALC-F009 risk into a reproduced bug; justifies a convergence-checker test mode |
+| TIMER-F006 | No native notification effect | Open (design decision recorded) | Elapse cannot alert the user outside the window; recommend schedule-attached notification descriptor |
 | TIMER-F007 | No durable schedule / overdue recovery | Open | Time passed while Youth was closed cannot be reconciled |
-| TIMER-F008 | Generations expressible but stale-delivery untestable | Open (boundary confirmation) | Needs host schedule identity to mean anything |
-| TIMER-F009 | Mode machine, bounded configuration, sessions, commands, and shortcuts are fully expressible today | Addressed (positive boundary confirmation) | The non-temporal 90% of the design needs no new protocol |
-| TIMER-F010 | The host does not enforce a button's `enabled` flag on activation; it is presentation only | Addressed (boundary confirmation) | The guest must self-guard every command regardless of what the UI shows |
+| TIMER-F008 | Generations expressible but stale-delivery untestable | Open (boundary confirmation) | Schedule generation must be host-issued, not conflated with an app session counter |
+| TIMER-F009 | Mode machine, bounded configuration, sessions, commands, and shortcuts are fully expressible today | Addressed (positive boundary confirmation) | The non-temporal design surface needs no new protocol — see "The main result" above |
+| TIMER-F010 | The host does not enforce a button's `enabled` flag on activation; it is presentation only | Addressed (boundary confirmation) | The guest must self-guard every command; test DSL naming (`activate` vs. a future `click`) recorded |
+| TIMER-F011 | Schedule ownership across app unloading is undefined | Open | "Temporarily unloaded" currently has no representation distinct from "process exited" |
 
-## TIMER-F001 — No guest-visible clock
+## Suggested Gate B priority
+
+Ordered so schedule correctness is proven independently of desktop
+presentation, and so nothing is built on an assumption TIMER-F011 has not
+yet settled:
+
+```text
+1. Define durable schedule storage independently of sleeping.
+2. Define host-issued schedule identity and generation (TIMER-F008).
+3. Make schedule creation, pause, resume, and cancellation transaction-bound.
+4. Build the virtual clock and scheduler state machine.
+5. Prove stale-wake rejection.
+6. Prove restart and overdue reconciliation headlessly.
+7. Add host-initiated elapsed-event delivery (TIMER-F002), settling
+   TIMER-F011 (schedule ownership without a live instance) before this step.
+8. Remove the Timer's manual `Advance` path (TIMER-F003's deletion list).
+9. Add countdown presentation afterward (TIMER-F004).
+10. Add notifications last (TIMER-F006's recorded (B) design).
+```
+
+## TIMER-F001 — No host-owned temporal capability
 
 - **Status:** Open
 - **Observed:** 2026-07-23
@@ -55,32 +98,51 @@ activation) standing in for a host clock that does not exist yet. See
   `std`; there is no SDK API that reads it, and `wasi:clocks/wall-clock` is
   not permitted at all.
 - **Developer impact:** A Timer author cannot ask "how much real time has
-  passed" from inside `view` or `handle`. The design's central primitive —
-  a bounded countdown — has no time source.
-- **What could not be expressed:** Any duration measurement, elapsed-time
-  query, or "now" reading.
+  passed" from inside `view` or `handle`, and cannot represent or present
+  time-dependent state declaratively. The design's central primitive — a
+  bounded countdown — has no way to be expressed at all today.
+- **This finding is not a request for a guest clock.** The design's own
+  "capability ownership" table already places clock access, sleeping, and
+  presentation refresh on the host, and this app agrees with that: nothing
+  here argues a guest should ever call `now()`. What is missing is
+  *declarative scheduling* ("elapse after this bounded duration") and
+  *host-owned temporal presentation* (a countdown that redraws without
+  invoking the guest) — not a way to measure time from inside a guest turn.
+  `youth:time` should not add `now()` merely to close this finding; doing
+  so would resolve the letter of the gap while missing its point. See
+  TIMER-F002 for the related but distinct gap this finding does *not*
+  cover: F001 is about representing time-dependent state and presentation
+  at all; F002 is about the host having any way to *initiate* a guest turn
+  because a deadline passed, as opposed to because a user acted.
+- **What could not be expressed:** A bounded countdown, a duration, or any
+  time-dependent presentation — declaratively, i.e. without the guest
+  itself standing in for the missing capability by tracking elapsed time
+  as ordinary state (see TIMER-F003).
 - **What felt repetitive:** Nothing at this stage; the gap is total, not
   incremental.
 - **What leaked WIT details:** None; the absence is visible from the WIT
   file itself without touching generated bindings.
 - **What required host policy:** Deciding whether a clock should ever be
-  guest-visible at all versus staying host-owned (the design's own
-  "capability ownership" table already answers this: clock access stays
-  host-owned).
-- **Unavoidable protocol addition:** A `youth:time` interface, or an
-  equivalent host-owned scheduling capability. This app cannot supply
-  evidence for its exact shape (see TIMER-F002), only for its necessity.
-- **What remains SDK/application behavior:** None of the clock itself; the
-  domain logic that consumes a tick (`Timer::advance`) is application-owned
-  and generalizes cleanly regardless of where the tick comes from.
+  guest-visible at all versus staying host-owned (already answered: it
+  stays host-owned), and deciding the shape of the declarative scheduling
+  primitive and host-owned countdown presentation that should replace it.
+- **Unavoidable protocol addition:** A declarative scheduling interface
+  (`youth:time` or equivalent) and host-owned temporal presentation. This
+  app can supply evidence for their necessity, not for their exact shape
+  (see TIMER-F002 for the delivery half of that shape).
+- **What remains SDK/application behavior:** None of the scheduling or
+  presentation primitive itself; the domain logic that consumes an elapsed
+  notification (`Timer::advance`'s eventual replacement) is
+  application-owned and generalizes cleanly regardless of where the
+  notification comes from.
 - **Impact:** Functional headless behavior is available for every operation
   except "wait." The published app cannot count down unattended, which is
   disclosed in `README.md` rather than hidden.
 - **Resolution:** None yet. `Command::Advance` stands in for the missing
   primitive; see `src/model.rs`'s module docs for how the substitution is
-  scoped.
+  scoped, and TIMER-F003 for the exact deletion path once this lands.
 
-## TIMER-F002 — No scheduled wakeup or elapsed-event delivery
+## TIMER-F002 — No host-initiated application turn
 
 - **Status:** Open
 - **Observed:** 2026-07-23
@@ -89,6 +151,14 @@ activation) standing in for a host clock that does not exist yet. See
 - **Platform:** Platform-independent WIT and runtime inspection
 - **Local path:** `/Users/keina/dev/youth-timer`
 - **Commit:** Initial app proof
+- **Distinct from TIMER-F001:** F001 is that a guest has no way to
+  *represent* time-dependent state or presentation at all. F002 is
+  narrower and specifically about *delivery*: even granting a guest a
+  perfect way to declare "elapse after this duration," nothing in the
+  runtime can invoke that guest's `handle` because a deadline passed
+  rather than because a user acted. A design that solved F001 alone
+  (e.g. a purely declarative duration with no delivery mechanism) would
+  still leave F002 unresolved.
 - **Evidence:** The `lifecycle` interface exposes only `mount`, `handle`, and
   `resync`; `event-kind` has exactly one variant, `activate(node-id)`. There
   is no way for the host to invoke a guest because a deadline passed rather
@@ -150,6 +220,35 @@ activation) standing in for a host clock that does not exist yet. See
 - **Impact:** No correctness risk today (the field is validated on every
   load via `Timer::is_valid`), but it is dead weight against the design's
   intended architecture.
+- **Deletion path:** This is scaffolding, not an alternative production
+  path to keep once `youth:time` exists. When it lands:
+
+  ```text
+  Remove:
+    - guest-owned remaining_seconds (Timer struct field and its accessor)
+    - the "Advance 1s" / "Advance 10s" commands and buttons
+    - Timer::advance
+    - the "advance-*" entries in app.rs's command table
+    - persistence of a continuously changing remaining-time value
+
+  Replace with:
+    - a host schedule identity held as opaque guest state
+    - host schedule generation (see TIMER-F008 — host-issued, not
+      guest-invented)
+    - a countdown presentation reference (the design's
+      Countdown::new(node!("remaining"), schedule)) instead of a
+      guest-formatted MM:SS string
+    - handling for a schedule-elapsed event instead of a manual command
+  ```
+
+  Tests should advance the design's virtual host clock at that point
+  (`advance time <duration>` in the design's own test-language sketch),
+  not continue calling `Timer::advance` — the manual command is a Gate A
+  substitute for the missing capability, not a feature to keep alongside
+  it. `.youth-test`'s `Command::Key`/`Command::Activate` distinction
+  (TIMER-F010) suggests the future virtual-clock control belongs as its
+  own new `.youth-test` command family, analogous to how `key` was added
+  for keyboard policy rather than overloading `activate`.
 - **Resolution:** None yet; tracked for removal once TIMER-F001/F002 land.
 
 ## TIMER-F004 — Countdown presentation cannot self-update
@@ -246,6 +345,51 @@ activation) standing in for a host clock that does not exist yet. See
   UI control that looks or (via keyboard) is enabled/disabled incorrectly
   after some turns, discoverable only by testing every control's reachable
   states, not by testing that state transitions are individually correct.
+- **Materially strengthens CALC-F009:** The calculator demonstrated
+  *theoretical* duplication — a handler has to remember that a display
+  node changed, but its buttons never change `enabled`, so nothing there
+  could actually diverge. This app produced an *actual* behavioral
+  failure: a fresh `view` correctly computed `start`'s eligibility, the
+  retained tree stayed stale because `handle` omitted `set_enabled`, and
+  keyboard shortcut resolution silently operated on the stale tree and
+  failed. CALC-F009 predicted this exact failure mode before any app had
+  produced it; TIMER-F005 is that evidence.
+- **Proposed tooling (not yet built in Youth):** This is now enough
+  evidence to justify a debug/test convergence checker, though not yet
+  enough to justify replacing explicit patches with SDK tree diffing or
+  declared reactive dependencies. A future test mode could, after each
+  accepted turn:
+
+  ```text
+  1. Apply the accepted Update to the previous normalized tree.
+  2. Commit the application state.
+  3. Invoke read-only view/resync from committed state.
+  4. Normalize the reconstructed tree.
+  5. Compare guest-owned semantics.
+  6. Report every divergent node and property.
+  ```
+
+  With a diagnostic in this shape:
+
+  ```text
+  view convergence failed after command `add-10s`
+
+  node `start`:
+    patched tree:       enabled = false
+    reconstructed view: enabled = true
+
+  node `reset`:
+    patched tree:       enabled = false
+    reconstructed view: enabled = true
+  ```
+
+  This should stay out of ordinary production turns — it duplicates a
+  `view` call per turn purely for verification — and could initially live
+  behind an opt-in test flag, e.g. `youth test --verify-view-convergence`,
+  in the Youth workspace's `crates/youth-test`. This app does not
+  implement that flag (it is host tooling, out of an app repo's scope);
+  it records the concrete design here because TIMER-F005 is the evidence
+  that would justify building it.
 - **Resolution:** `src/app.rs`'s `handle` now recomputes `ButtonEnabled` and
   calls `set_enabled` for all eleven command buttons on every state-changing
   turn, from the same function `view` uses. `tests/basic.youth-test` exercises
@@ -254,8 +398,10 @@ activation) standing in for a host clock that does not exist yet. See
   not have caught this bug — see TIMER-F010, a related finding this same
   investigation produced. The platform-level question CALC-F009 raises
   (should there be a convergence check, SDK-level tree diffing, or declared
-  reactive dependencies instead of explicit patches) remains open; this
-  finding adds a second application's evidence toward answering it.
+  reactive dependencies instead of explicit patches) remains open; Timer and
+  Calculator together justify building the convergence checker described
+  above eventually, but do not yet justify reactive dependencies or SDK
+  tree diffing.
 
 ## TIMER-F006 — No native notification effect
 
@@ -285,8 +431,60 @@ activation) standing in for a host clock that does not exist yet. See
   (already answered by the design: on elapse) stays application-owned.
 - **Impact:** No functional loss for the headless model; a real loss for
   the app's usefulness as a background timer.
+- **Design decision to make before Gate C:** There are two shapes this
+  capability could take, and they are not equivalent:
+
+  ```text
+  A. Guest requests notification after elapsed delivery
+     deadline expires -> host queues elapsed event -> guest handles it
+     -> guest requests notification effect
+
+     + notification content can depend on current application state
+     + no notification data needs to be attached to the schedule
+     - notification requires a successful guest turn
+     - a trapped or unloaded guest may delay or prevent it
+     - less reliable while the app is backgrounded/unloaded
+
+  B. Notification intent is attached to the schedule
+     guest schedules deadline with a bounded notification descriptor
+     -> host persists both transactionally -> deadline expires
+     -> host displays a best-effort notification directly
+     -> host independently queues the durable elapsed event
+
+     + does not depend on waking the guest successfully
+     + matches runtime-resident background behavior
+     + notification and elapsed delivery stay operationally separate
+     - schedule API becomes slightly larger
+     - notification content must be declared in advance
+     - localization / dynamic content need future consideration
+  ```
+
+  This app's recommendation is **(B)**, a small bounded notification
+  descriptor attached to the schedule at creation:
+
+  ```rust
+  context.time().schedule_after(
+      duration,
+      ScheduleOptions::new()
+          .notification(Notification::new(
+              "Timer complete",
+              "Your timer has elapsed.",
+          )),
+  )?;
+  ```
+
+  This does not make notification delivery durable or exactly-once — it
+  is still best-effort, per the design's own "Notification semantics"
+  section — it only lets the host attempt it directly when the schedule
+  becomes due, without depending on a guest turn succeeding first, which
+  matters specifically because TIMER-F011 raises the same "no live guest
+  instance" scenario this decision needs to survive.
 - **Resolution:** None yet; explicitly deferred behind TIMER-F002 by the
-  design itself.
+  design itself. Recording the (B)-shaped decision now so Gate B/C
+  scoping does not default to (A) by omission; this finding should not by
+  itself be read as requiring a general, freeform notification effects
+  API — a bounded, schedule-attached descriptor is the narrower and
+  recommended shape.
 
 ## TIMER-F007 — No durable schedule or overdue recovery across process exit
 
@@ -356,11 +554,44 @@ activation) standing in for a host clock that does not exist yet. See
 - **Unavoidable protocol addition:** None beyond what TIMER-F002 already
   requires; a schedule's generation would need to be the identity a host
   schedule carries, not just a guest-state counter.
+- **Generation ownership must move to the host, not merely gain a delivery
+  path:** `Timer::generation` today is *application session bookkeeping*,
+  and that is a different thing from *schedule delivery identity*, even
+  though this app currently conflates them in one field. Once
+  `youth:time` exists, the design's stale-wakeup rejection
+  (`schedule-after` returning an opaque identity + generation the host
+  itself assigns and checks) is not something a guest can offer to
+  provide — a guest-invented counter cannot be trusted to reject a wake
+  the guest itself did not generate. Keep these separate:
+
+  ```text
+  session number:
+      application meaning (e.g. "this is the Nth countdown the user has
+      run"). Guest-owned, guest-incremented, purely domain logic.
+
+  schedule generation:
+      host delivery identity, assigned by context.time().schedule_after(...)
+      and checked by the host before ever invoking the guest with a wake.
+      The guest may durably store and read it back, but must not invent it.
+  ```
+
+  A calculator-like domain model (or this Timer) may keep its own session
+  number for display/counting purposes (this app's `completed_sessions`
+  is exactly that), but a future `youth:time` schedule identity is a
+  distinct field the guest receives from the host, not something the
+  guest computes from `start`/`reset` calls the way `generation` is
+  computed today.
 - **What remains SDK/application behavior:** The increment rule itself
   (`start`/`reset` bump it, `resume` does not) is domain logic and stays
-  application-owned regardless of what carries the identity.
+  application-owned regardless of what carries the identity; only the
+  *delivery-rejection* generation must be host-issued.
 - **Impact:** None measurable today.
-- **Resolution:** None yet; becomes testable once TIMER-F002 exists.
+- **Resolution:** None yet; becomes testable once TIMER-F002 exists. When
+  it does, expect `Timer::generation` to either become dead code (deleted
+  alongside the rest of TIMER-F003's deletion list) or to be explicitly
+  renamed and re-scoped as a session counter distinct from the host's
+  schedule generation — not silently repurposed as if it already were
+  one.
 
 ## TIMER-F009 — The non-temporal design surface is fully expressible today
 
@@ -442,5 +673,96 @@ activation) standing in for a host clock that does not exist yet. See
   checking remains, and should remain, application-owned.
 - **Impact:** No defect; a documented boundary a future Utility Suite app
   should not re-discover the hard way.
+- **Test DSL naming risk:** `.youth-test`'s `activate <name>` can mislead
+  an author into believing it simulates user interaction; in fact it is
+  direct semantic injection that bypasses every host interaction policy
+  `key` goes through (enabled-button filtering, focus, shortcut
+  resolution). That difference is exactly what makes it useful for
+  proving TIMER-F010 — but the same property means a passing `activate`
+  test proves nothing about whether a real user could reach that command
+  through the UI at all. The three-way distinction worth documenting
+  going forward, once it earns its complexity:
+
+  ```text
+  invoke advance-1s
+      Directly inject semantic activation.
+      May target a disabled control.
+      Tests guest command validation. (today's `activate`, precisely named)
+
+  click advance-1s
+      Pass through host interaction policy.
+      Requires the node to be enabled and hittable.
+
+  key "1"
+      Pass through focus and shortcut policy. (today's `key`, unchanged)
+  ```
+
+  This app does not need a `click` command yet — nothing here required
+  proving "hittable," only "enabled." Renaming or adding to the DSL is a
+  Youth-workspace `crates/youth-test` change, not something this app can
+  do alone. Recorded now, in the same investigation that produced the
+  gap, specifically so a future Utility Suite app does not rediscover
+  TIMER-F010 by assuming `activate` means what `click` would mean.
 - **Resolution:** N/A; confirming evidence, exercised by
-  `tests/basic.youth-test`'s paused-advance case.
+  `tests/basic.youth-test`'s paused-advance case, which is now commented
+  to state explicitly that it relies on `activate` bypassing interaction
+  policy (see the test file for the exact wording).
+
+## TIMER-F011 — Schedule ownership across app unloading is undefined
+
+- **Status:** Open
+- **Observed:** 2026-07-23
+- **Application:** Youth Timer
+- **Workflow stage:** Design-document review against `crates/youth-runtime`
+- **Platform:** Platform-independent source inspection
+- **Local path:** `/Users/keina/dev/youth-timer`
+- **Commit:** Initial app proof
+- **Evidence:** The design's "Background and shutdown behavior" section
+  requires deadlines to remain active while a window is "minimized,
+  hidden, unfocused, or temporarily unloaded," and separately describes
+  "overdue recovery" for when the whole Youth *process* exits. Those are
+  two different lifecycles, and only the second one currently has any
+  answer. `crates/youth-runtime/src/worker.rs`'s `YouthAppHandle::spawn`
+  (and `spawn_ephemeral`) is the only way an app instance comes to exist:
+  a dedicated worker thread owning one live `Store` and one live guest
+  instance, for the lifetime of that handle. Nothing in the runtime
+  represents a durable schedule as an entity independent of a spawned
+  worker — there is no host-side scheduling service that could remain
+  armed while an app instance is "temporarily unloaded" but the Youth
+  process keeps running.
+- **Developer impact:** The design's "app instance temporarily unloaded,
+  but Youth stays running, and the deadline should still fire" scenario
+  cannot be built on the current architecture without first answering who
+  owns the schedule during that gap — and the honest current answer is
+  "nobody," because nothing exists yet that is not either a live instance
+  or a fully-restarted process.
+- **What could not be expressed:** A durable schedule that outlives one
+  particular spawned `YouthAppHandle` while the host process keeps
+  running.
+- **What felt repetitive:** N/A.
+- **What leaked WIT details:** None.
+- **What required host policy:** This is entirely a host-lifecycle
+  question: whether a durable schedule should be indexed independently of
+  any live instance (by app ID, schedule ID, generation, protocol
+  version, and delivery status), with the scheduler able to, when due,
+  queue the durable elapsed delivery, attempt a notification, and load or
+  wake the application per host policy — rather than assuming every
+  host-initiated event must target an already-running actor the way
+  `YouthAppHandle` does today.
+- **Unavoidable protocol addition:** None beyond TIMER-F001/F002 at the
+  guest-facing layer; this finding is specifically about host-internal
+  architecture (a schedule service decoupled from the worker-per-instance
+  model), which a guest never observes directly except through whether
+  "temporarily unloaded" deadlines actually fire.
+- **What remains SDK/application behavior:** None; this is entirely a
+  host runtime architecture question.
+- **Impact:** If unaddressed, "temporarily unloaded" degrades silently
+  into "process exited" — i.e., the design's minimized/unfocused case
+  would only work by accident of the instance happening to still be
+  spawned, not because anything guarantees it.
+- **Resolution:** None yet. Recorded as a Gate B finding because the
+  design's own distinction between "Youth running" (background) and
+  "Youth process exited" (overdue) assumes an intermediate state the
+  current runtime has no representation for; Gate B schedule-storage work
+  should decide this before building host-initiated delivery on top of
+  it, not after.
