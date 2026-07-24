@@ -1,0 +1,72 @@
+# Youth Timer semantic test — runs against the real headless runtime.
+#
+# This exercises the full mode machine (Idle -> Running -> Elapsed ->
+# acknowledged back to Idle, and Running -> Paused), durable-state
+# persistence across a restart, the keyboard-shortcut path, and the
+# guest-side no-op guard on a command whose button is presented disabled.
+# See ../FINDINGS.md for what this test cannot exercise (no real elapsed
+# time passes anywhere here — every tick is an explicit command).
+
+mount
+expect text countdown "00:00"
+expect text mode "Mode: idle"
+expect text sessions "Sessions: 0"
+expect focus none
+
+# Configure a 10-second session via direct activation.
+activate add-10s
+expect text countdown "00:10"
+expect text mode "Mode: idle"
+
+# Start via its keyboard shortcut (Enter), not a direct activation, to
+# prove the declared Shortcut::Enter actually reaches the guest as the
+# same "start" command.
+key enter
+expect text mode "Mode: running"
+expect text countdown "00:10"
+
+# Advance the full 10 seconds via its shortcut ('k') and reach Elapsed.
+key "k"
+expect text mode "Mode: elapsed"
+expect text countdown "00:00"
+expect text sessions "Sessions: 1"
+
+# Durable state must survive a restart: mode and the completed-session
+# count are the canonical model, not a derived display string.
+restart
+expect text mode "Mode: elapsed"
+expect text countdown "00:00"
+expect text sessions "Sessions: 1"
+
+# Acknowledge via its shortcut ('o') returns to Idle at the configured
+# duration.
+key "o"
+expect text mode "Mode: idle"
+expect text countdown "00:10"
+
+# Start a second session, then pause it.
+key enter
+expect text mode "Mode: running"
+activate advance-1s
+expect text countdown "00:09"
+activate pause
+expect text mode "Mode: paused"
+expect text countdown "00:09"
+
+# The "advance-1s" button is presented disabled while paused, but the
+# host does not enforce that flag on activation (it is a presentation
+# hint, not access control) -- so this activation reaches the guest.
+# The guest's own model must reject it: advance is a no-op outside
+# Running. This is the guest-side guard the FINDINGS document records
+# as necessary rather than optional.
+activate advance-1s
+expect text mode "Mode: paused"
+expect text countdown "00:09"
+
+# Resume and cancel back to Idle at the configured duration.
+activate resume
+expect text mode "Mode: running"
+activate cancel
+expect text mode "Mode: idle"
+expect text countdown "00:10"
+expect text sessions "Sessions: 1"

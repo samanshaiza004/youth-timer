@@ -1,0 +1,4 @@
+# Keep the inspectable WIT snapshot and all source files LF on every host.
+* text=auto eol=lf
+
+*.wasm binary

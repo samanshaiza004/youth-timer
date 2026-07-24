@@ -1,0 +1,14 @@
+[package]
+name = "youth-timer"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+youth-sdk = { git = "https://github.com/samanshaiza004/youth", rev = "8696bd97ebc4f1d34b9f632e5992dd1882b724de" }
+
+[profile.release]
+lto = true

@@ -1,0 +1,12 @@
+[app]
+id = "dev.saman.timer"
+name = "Youth Timer"
+protocol = "0.0.3"
+
+[build]
+language = "rust"
+package = "youth-timer"
+target = "wasm32-wasip2"
+
+[development]
+state = ".youth/state"
