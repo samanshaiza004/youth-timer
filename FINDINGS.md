@@ -35,7 +35,7 @@ Not needed:
 
 | ID | Summary | Next decision |
 | --- | --- | --- |
-| TIMER-F001 | No host-owned temporal capability; a countdown cannot advance or present without one | Requires declarative scheduling + host-owned presentation design — not a guest-visible clock |
+| TIMER-F001 | No host-owned temporal capability; a countdown cannot be declared, delivered, or presented (corrected 2026-07-25: guests *can* read monotonic time via `Instant::now()`) | Requires declarative scheduling + host-owned presentation; also decide whether `wasi:clocks/monotonic-clock` stays permitted, since it breaks test hermeticity |
 | TIMER-F002 | No host-initiated application turn | Same; the design's "arm a deadline" step has no protocol home today |
 | TIMER-F003 | Remaining duration must be durable guest state, duplicating what a host schedule would own | Resolves automatically once TIMER-F001/F002 are addressed; deletion path recorded below |
 | TIMER-F004 | Countdown presentation cannot update without invoking the guest | Requires host-owned temporal presentation (the design's countdown node) |
@@ -49,7 +49,7 @@ Not needed:
 
 | ID | Summary | Status | Primary implication |
 | --- | --- | --- | --- |
-| TIMER-F001 | No host-owned temporal capability | Open | A countdown can only advance on user or test action; resolution is scheduling + presentation, not `now()` |
+| TIMER-F001 | No host-owned temporal capability (corrected: measurement *is* possible; delivery and presentation are not) | Open | The gap is being woken and presenting, not reading a clock; `monotonic-clock` permission is a hermeticity hole |
 | TIMER-F002 | No host-initiated application turn | Open | "Start" cannot arm a deadline; only mode changes |
 | TIMER-F003 | Guest must persist remaining duration itself | Open | A second source of truth the host would otherwise own; deletion path recorded |
 | TIMER-F004 | Countdown cannot self-update | Open | Every visible tick costs a full guest turn |
@@ -92,15 +92,49 @@ yet settled:
 - **Commit:** Initial app proof
 - **Evidence:** `wit/youth/youth-app.wit` and `wit/youth/deps/youth-state/store.wit`
   declare no time, clock, or duration type. The `application` world's only
-  import is `youth:state/store@0.0.1`. The host's guest-import allowlist
-  (`docs/GUEST-PROFILE.md` in the Youth workspace) permits
-  `wasi:clocks/monotonic-clock` only as an inert artifact of linking Rust
-  `std`; there is no SDK API that reads it, and `wasi:clocks/wall-clock` is
-  not permitted at all.
-- **Developer impact:** A Timer author cannot ask "how much real time has
-  passed" from inside `view` or `handle`, and cannot represent or present
-  time-dependent state declaratively. The design's central primitive — a
-  bounded countdown — has no way to be expressed at all today.
+  import is `youth:state/store@0.0.1`. There is no SDK API that reads a
+  clock, and `wasi:clocks/wall-clock` is not permitted by the host's
+  guest-import allowlist.
+- **CORRECTION (2026-07-25):** This finding originally claimed the guest
+  had *no time source at all*, and described
+  `wasi:clocks/monotonic-clock` as "inert." **That was wrong**, and the
+  error is recorded rather than silently edited away. A guest can in fact
+  read real monotonic time today by bypassing the SDK and calling
+  `std::time::Instant::now()` directly. Verified chain, in the Youth
+  workspace at commit `48dce6d`:
+  1. `crates/youth-runtime/src/profile.rs:28` lists
+     `wasi:clocks/monotonic-clock` in `PERMITTED_GUEST_IMPORTS`.
+  2. This app's own built component imports it — visible in
+     `wasm-tools component wit dist/dev.saman.timer.wasm`.
+  3. `configure_wasi` calls `wasmtime_wasi::p2::add_to_linker_sync`, which
+     links `clocks::monotonic_clock` (`wasmtime-wasi-46.0.1`,
+     `src/p2/mod.rs:345`).
+  4. `WasiCtxBuilder::new().build()` yields `WasiClocksCtx::default()`,
+     which installs the **real host monotonic clock**
+     (`wasmtime-wasi-46.0.1`, `src/clocks.rs:57-63`) — clocks are not
+     opt-in the way stdio/env/fs are.
+
+  Confirmed from source, not yet from a running experiment; a test
+  component that reads `Instant::now()` across two turns should be added
+  to the Youth workspace to make this empirical and regression-tested.
+- **What this does and does not change:** The design's thesis is
+  *strengthened*, not weakened. What a guest can do is *measure* elapsed
+  time between turns it is already running in. What it still cannot do —
+  and what `youth:time` must actually provide — is be **woken** when a
+  duration passes, present a countdown without a turn, or have a
+  deadline survive process exit. The gap was never measurement; it is
+  delivery and presentation. TIMER-F002 was already the more precisely
+  stated half of this finding, and this correction makes F001 narrower
+  and F002 comparatively more important.
+- **Hermeticity consequence:** because the clock is real, a guest could
+  observe wall-time progression that a virtual test clock does not
+  control. Any Gate B work that promises deterministic, time-hermetic
+  headless tests must decide whether `wasi:clocks/monotonic-clock` stays
+  permitted. This is now a Gate B decision, not a documentation detail.
+- **Developer impact:** A Timer author cannot express a bounded countdown
+  *declaratively*, cannot be called when it elapses, and cannot present it
+  without a guest turn. They can, if they reach past the SDK, measure how
+  much time passed between two turns the user already caused.
 - **This finding is not a request for a guest clock.** The design's own
   "capability ownership" table already places clock access, sleeping, and
   presentation refresh on the host, and this app agrees with that: nothing
