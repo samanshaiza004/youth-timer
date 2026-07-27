@@ -4,12 +4,14 @@ This is the canonical evidence record for the Timer entry in the Youth
 Utility Suite. Findings describe observed application friction; they do not
 automatically authorize platform features.
 
-This app is deliberately a **Gate A** proof: it implements the Timer domain
-model and command surface with today's Youth capabilities and records what
-could not be built. It does not count down on its own. Every tick is an
-explicit command (`Advance 1s` / `Advance 10s`, or the equivalent test
-activation) standing in for a host clock that does not exist yet. See
-`README.md` for what this means for anyone trying the app.
+Gate A implemented the Timer domain model and command surface with the
+capabilities Youth had at the time, and recorded what could not be built.
+Gate C-1 versioned and migrated that durable state. Gate C-2 wires
+`Start`/`Pause`/`Resume`/`Cancel`/`Reset` to real host schedules through
+`context.time()` and reacts to autonomous `ScheduleElapsed` delivery in
+principle, though that delivery path is unproven from this repo's own
+test suite (see the Gate status section below). See `README.md` for the
+current state and what remains open.
 
 ## The main result
 
@@ -31,53 +33,59 @@ Not needed:
   - a different persistence API
 ```
 
-## Gate B has landed in the platform; this app has not migrated
+## Gate status: Gate C-1 and the synchronous half of C-2 are complete
 
-Youth implemented `youth:time@0.0.1` and durable scheduling in Gate B
-(Developer Preview 2). That changes the *platform* answer to several
-findings below, but **this application still runs the Gate A design** —
-every tick is still an explicit `Advance` command. Findings therefore
-keep their Gate A status except where the finding was purely a question
-about host architecture:
-
-- **TIMER-F011 is closed.** It asked who owns a schedule when no guest
-  instance is mounted, which was answerable without the app changing.
-- **TIMER-F001, F002, F003, F007, F008** now have platform answers
-  (declarative scheduling, host-initiated delivery, host-owned schedule
-  state, overdue reconciliation, host-issued generations), but remain
-  open *as application evidence* until the Timer adopts `context.time()`
-  and deletes its manual-advance path (TIMER-F003's deletion list).
-- **TIMER-F004 and F006** are untouched: host-owned countdown
-  presentation and notification are Gate C and Gate D.
+- **TIMER-F003 and TIMER-F008 are closed as application evidence, not
+  just platform capability.** `remaining_seconds` and the guest-invented
+  `generation` are gone from `src/model.rs` entirely; `ScheduleHandle`'s
+  generation is the real value `Schedule::generation()` returns, and
+  `LEGACY_KEYS` are deleted, never reused, on migration.
+- **TIMER-F011 is closed** (unchanged from Gate B: a durable schedule's
+  ownership never required a live guest instance).
+- **TIMER-F001, F002, and F007 are partially closed.** `Start`, `Pause`,
+  `Resume`, `Cancel`, and `Reset` all now perform a real host schedule
+  operation before the model transitions (`src/app.rs`'s `apply_command`),
+  and `restart` proves the resulting schedule identity survives a process
+  exit and revalidates on remount — real evidence for declaration and for
+  the storage half of F007. What remains unproven **from this repo's own
+  test suite**: `.youth-test` has no way to wait on real elapsed time or
+  fire a virtual-clock wake, so the autonomous `ScheduleElapsed` path
+  (`handle_elapsed`) has never actually been exercised end to end here,
+  only reviewed. Overdue reconciliation across a real process-closed
+  interval is similarly unproven from this side. TIMER-F013 already named
+  the boundary; delivery testing is the concrete case it predicted.
+- **TIMER-F004 and F006 are untouched.** `display()` still reports the
+  configured duration, not a live countdown — host-owned temporal
+  presentation is Gate C-3. Notification is Gate D.
 
 ## Open findings
 
 | ID | Summary | Next decision |
 | --- | --- | --- |
-| TIMER-F001 | No host-owned temporal capability; a countdown cannot be declared, delivered, or presented (corrected 2026-07-25: guests *can* read monotonic time via `Instant::now()`) | Requires declarative scheduling + host-owned presentation; also decide whether `wasi:clocks/monotonic-clock` stays permitted, since it breaks test hermeticity |
-| TIMER-F002 | No host-initiated application turn | Same; the design's "arm a deadline" step has no protocol home today |
-| TIMER-F003 | Remaining duration must be durable guest state, duplicating what a host schedule would own | Resolves automatically once TIMER-F001/F002 are addressed; deletion path recorded below |
+| TIMER-F001 | *(partially closed, C-2)* Declaration and persistence now use real host schedules; delivery and presentation remain unproven from this repo | Prove `ScheduleElapsed` end to end once a virtual-clock test path exists; build host-owned presentation (Gate C-3) |
+| TIMER-F002 | *(code path exists, C-2)* `handle_elapsed` reacts to `ScheduleElapsed`, but no test in this repo has ever driven a real delivery through it | Needs the same virtual-clock test path as F001 |
+| TIMER-F003 | *(closed, C-1/C-2)* `remaining_seconds` deleted; the host owns it entirely | None; closed |
 | TIMER-F004 | Countdown presentation cannot update without invoking the guest | Requires host-owned temporal presentation (the design's countdown node) |
 | TIMER-F005 | Incremental `handle` updates can silently diverge from a fresh `view` | Materially strengthens CALC-F009; justifies building a `--verify-view-convergence` test mode (design recorded below), not yet SDK diffing/reactive dependencies |
 | TIMER-F006 | No native notification effect on elapse | Decision recorded: attach a bounded notification descriptor to the schedule, not a general effects API |
-| TIMER-F007 | No durable schedule or overdue recovery across process exit | Same; `restart` proves app-state persistence, not real-time reconciliation |
-| TIMER-F008 | Generations are expressible as state but stale-delivery is untestable without real scheduling | Schedule generation must be host-issued identity, distinct from any guest session counter |
+| TIMER-F007 | *(partially closed, C-2)* `restart` now proves the schedule identity itself persists and revalidates, not just app state | Overdue reconciliation across a real closed-process interval is still unproven from this repo |
+| TIMER-F008 | *(closed, C-2)* `ScheduleHandle`'s generation is the real host-issued value; `completed_sessions` stays a separate application counter | None; closed |
 
 ## Findings index
 
 | ID | Summary | Status | Primary implication |
 | --- | --- | --- | --- |
-| TIMER-F001 | No host-owned temporal capability (corrected: measurement *is* possible; delivery and presentation are not) | Open | The gap is being woken and presenting, not reading a clock; `monotonic-clock` permission is a hermeticity hole |
-| TIMER-F002 | No host-initiated application turn | Open | "Start" cannot arm a deadline; only mode changes |
-| TIMER-F003 | Guest must persist remaining duration itself | Open | A second source of truth the host would otherwise own; deletion path recorded |
+| TIMER-F001 | Declaration/persistence via real schedules | Partially addressed (C-2) | Delivery and presentation remain unproven from this repo's own tests |
+| TIMER-F002 | `handle_elapsed` exists but is untested end to end | Partially addressed (C-2) | Needs a virtual-clock test path this repo does not have |
+| TIMER-F003 | Guest no longer persists remaining duration | Addressed (C-1/C-2) | `remaining_seconds` deleted entirely |
 | TIMER-F004 | Countdown cannot self-update | Open | Every visible tick costs a full guest turn |
 | TIMER-F005 | Incremental `handle` updates can silently diverge from a fresh `view` | Addressed in this app; platform risk remains open (tracked by youth's CALC-F009) | Turns theoretical CALC-F009 risk into a reproduced bug; justifies a convergence-checker test mode |
 | TIMER-F006 | No native notification effect | Open (design decision recorded) | Elapse cannot alert the user outside the window; recommend schedule-attached notification descriptor |
-| TIMER-F007 | No durable schedule / overdue recovery | Open | Time passed while Youth was closed cannot be reconciled |
-| TIMER-F008 | Generations expressible but stale-delivery untestable | Open (boundary confirmation) | Schedule generation must be host-issued, not conflated with an app session counter |
+| TIMER-F007 | Schedule identity persists and revalidates across restart | Partially addressed (C-2) | Overdue reconciliation across a real closed interval remains unproven here |
+| TIMER-F008 | Schedule generation is host-issued in the running application | Addressed (C-2) | `ScheduleHandle` mirrors the real `Schedule.generation()` value |
 | TIMER-F009 | Mode machine, bounded configuration, sessions, commands, and shortcuts are fully expressible today | Addressed (positive boundary confirmation) | The non-temporal design surface needs no new protocol — see "The main result" above |
 | TIMER-F010 | The host does not enforce a button's `enabled` flag on activation; it is presentation only | Addressed (boundary confirmation) | The guest must self-guard every command; test DSL naming (`activate` vs. a future `click`) recorded |
-| TIMER-F013 | The `.youth-test` DSL cannot seed pre-existing durable state, so migration paths cannot be integration-tested | Open | Migration correctness rests on unit tests plus review rather than end-to-end evidence |
+| TIMER-F013 | The `.youth-test` DSL can now seed durable state (Youth `97d7b3b`'s successor commit) but still cannot wait on real time or fire a virtual-clock wake | Partially addressed | Migration is now integration-tested (see `tests/migration_then_start.youth-test`); elapsed-delivery testing remains the open corollary |
 | TIMER-F012 | An application cannot migrate its own durable state at load time; `view` is read-only | Open | Migration must defer to the first event turn, so legacy interpretation can never be retired on the app's own schedule |
 | TIMER-F011 | Schedule ownership across app unloading is undefined | Addressed (Gate B) | The host owns schedule existence, due detection, and pending delivery; the guest owns only its transactional reaction |
 
@@ -902,46 +910,78 @@ yet settled:
 
 ## TIMER-F013 — The test DSL cannot seed pre-existing durable state
 
-- **Status:** Open
+- **Status:** Partially addressed
 - **Observed:** 2026-07-27
 - **Application:** Youth Timer
-- **Workflow stage:** Gate C-1 migration testing
+- **Workflow stage:** Gate C-1 migration testing; closed the seeding half
+  during Gate C-2 wiring
 - **Platform:** macOS, headless `youth test`
 - **Local path:** `/Users/keina/dev/youth-timer`
-- **Commit:** Gate C-1
-- **Evidence:** `.youth-test` offers `mount`, `restart`, `activate`,
-  `key`, `expect text`, and `expect focus`. Every one of them operates on
-  an application that started from an **empty** state file — the runner
-  creates a fresh temporary `state.sqlite3` per test file. There is no
-  command that writes a durable record before `mount`.
-- **Developer impact:** An application cannot integration-test any code
+- **Commit:** Gate C-1 (opened) → Youth workspace commit `4a0bba1`
+  (seeding landed)
+- **Evidence:** `.youth-test` originally offered only `mount`, `restart`,
+  `activate`, `key`, `expect text`, and `expect focus`, all operating on
+  an application that started from an **empty** state file per test —
+  there was no command that wrote a durable record before `mount`.
+  `crates/youth-test` now adds `state <type> "key" <value>` (seed
+  before-mount only, through the real `StateStore` API, respecting
+  quotas, unable to touch Youth-owned tables) and `expect state <type>
+  "key" <value>` / `expect state missing "key"`. `tests/migration_then_start.youth-test`
+  and `tests/migration_then_dismiss.youth-test` use this to construct a
+  genuine legacy v1 record and prove, through the real runtime, that it
+  is read, classified, rewritten to v2, and has its legacy keys deleted
+  — the exact gap this finding named.
+- **Developer impact:** An application can now integration-test the code
   path that only runs against state written by an *earlier version of
-  itself*. Migration is exactly that path. This app can prove its
-  migration policy is correct as a pure function (`migrate_legacy` in
-  `src/model.rs`, six unit tests), and can prove a fresh v2 record works
-  end to end, but **cannot** prove through the real runtime that a
-  genuine legacy record is read, rewritten, and has its legacy keys
-  deleted.
+  itself*, closing the original gap for migration specifically.
 - **What could not be expressed:** "Given this durable state, mount and
-  assert." Youth's own workspace tests do exactly this for the
-  `youth:state` v1→v2 migration by constructing a legacy database
-  directly — an application repository has no equivalent.
+  assert." Now expressible for state that exists *before* mount. Still
+  not expressible: state changes injected *mid-test*, or a schedule
+  delivery firing mid-test without a real wall-clock wait — see the
+  delivery-testing gap noted in the Gate status section above, and the
+  failure-injection requirement below.
 - **What felt repetitive:** N/A.
-- **What leaked WIT details:** None.
+- **What leaked WIT details:** None; `state`/`expect state` go through
+  the same typed `StateStore` API the application itself uses.
 - **What required host policy:** Whether the test DSL should be able to
-  seed state, and if so in what representation. A `state set <key>
-  <value>` command would leak the storage model into the test language,
-  which the DSL has so far deliberately avoided. A better shape may be
-  seeding from a fixture file, or a `given state <file>` prelude.
+  seed state, and in what representation. Resolved as typed key/value
+  seeding (matching the SDK's own `integer`/`text`/`boolean`/`bytes`
+  types) rather than a raw fixture file, so a seed command cannot express
+  anything an application couldn't otherwise write.
 - **Unavoidable protocol addition:** None; this is test tooling in
   `crates/youth-test`.
 - **What remains SDK/application behavior:** Migration policy is
   application-owned and is unit-testable if the application keeps it in a
-  pure module, which is the workaround adopted here.
-- **Impact:** Migration correctness rests on unit tests plus review, not
-  on end-to-end evidence. For an operation whose entire purpose is to
-  handle records this version of the code never wrote, that is a real
-  coverage gap.
-- **Resolution:** None yet. Worked around by extracting `migrate_legacy`
-  into the pure model so the policy is host-testable, and by keeping
-  state I/O in `app.rs` thin enough to review.
+  pure module, which is the workaround this app also adopted.
+- **Impact:** Migration correctness now rests on end-to-end evidence, not
+  only unit tests plus review.
+- **Resolution:** Closed for pre-mount state seeding. Remaining scope
+  (mid-test state mutation, fault injection, virtual-clock delivery) is
+  tracked separately — see the failure-injection note directly below,
+  which this repo cannot close from its own test suite.
+
+## Failure injection across schedule creation — not testable from this repo
+
+Gate C-2 requires proving that a failure injected after schedule
+creation, but before the turn commits, leaves no partial state: legacy
+keys remain, current-schema keys do not appear, no schedule survives,
+and the tree is unchanged. `.youth-test` has no fault-injection
+primitive — no command exists to make a mid-turn host call fail on
+command. The turn machinery this property depends on (clone → begin
+transaction → guest call → validate → apply to staged clone → commit →
+install → publish, all-or-nothing) is Youth-workspace code, not
+application code, so the strongest evidence obtainable from
+`/Users/keina/dev/youth-timer` alone is: (1) review of `app.rs`'s
+`apply_command`, which never calls `set_schedule`/`model.start` before
+`context.time().schedule_after` succeeds, so a failed host call returns
+`Err` before either write happens; and (2) the existing
+`migration_then_start.youth-test`, which proves the *successful* combined
+path commits state and schedule together. Proving the *rollback* path —
+that a failure between schedule creation and commit leaves nothing
+partially written — requires the `test-support` fault-injection feature
+that already exists in the Youth workspace's own transactional-turn
+tests, exercised against a Timer-shaped fixture there, not from this
+application repository. This is the same category of boundary as the
+`ScheduleElapsed`-delivery gap noted in the Gate status section: real,
+named, and deliberately left open rather than claimed closed on
+review alone.

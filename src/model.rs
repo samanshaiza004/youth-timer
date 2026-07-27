@@ -20,6 +20,24 @@
 //! nothing counts down. Gate C-2 restores that by arming a real host
 //! schedule through `context.time()` and reacting to an autonomous
 //! `ScheduleElapsed` delivery.
+//!
+//! # Gate C-2: schedule identity
+//!
+//! `Running` and `Paused` now carry a [`ScheduleHandle`] — the host-issued
+//! `(id, generation)` pair, and nothing else. This module has no
+//! dependency on `youth_sdk`, so it cannot use the SDK's own `Schedule`
+//! type directly; `ScheduleHandle` is a local mirror of exactly its two
+//! fields, and `app.rs` converts between them at the boundary. No
+//! remaining-time value is ever stored here or anywhere durable
+//! (TIMER-F003): the host owns it entirely.
+//!
+//! Every operation that changes when a schedule would fire — starting,
+//! pausing, resuming — must first ask the host and receive back a new
+//! handle before this model transitions (TIMER-F008 and the D2 pause/
+//! resume correction in `DEVELOPER-PREVIEW-2.md`: the host bumps the
+//! generation on every such call, so the guest cannot keep using a
+//! pre-call handle). Cancelling and resetting an active session ask the
+//! host to retire the handle and pass no replacement.
 
 /// The Timer's application mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,21 +57,34 @@ pub enum Mode {
 /// design's seconds-precision bound and the `MM:SS` display format.
 pub const MAX_SECONDS: u64 = 99 * 60 + 59;
 
+/// A host-issued schedule identity: the `(id, generation)` pair, and
+/// nothing else. A local mirror of `youth_sdk::Schedule`'s two accessors,
+/// kept here rather than depending on the SDK, so this module stays
+/// host-testable. `app.rs` is the only place that converts between the
+/// two.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScheduleHandle {
+    pub id: u64,
+    pub generation: u64,
+}
+
 /// The canonical, durable application state.
 ///
 /// Every field here is what the design's "Application model" section says
-/// the guest should persist: mode, configured duration, and a
-/// completed-session count. There is no native timestamp and no host clock
-/// reading. Gate C-1 removed `remaining_seconds` and the guest-invented
-/// `generation`: the former was only ever decremented by manual `Advance`
-/// clicks and so never tracked real time, and the latter is replaced by a
-/// host-issued schedule generation in C-2 (TIMER-F003, TIMER-F008). A
-/// paused session's remainder becomes host-owned, not guest state.
+/// the guest should persist: mode, configured duration, the active
+/// schedule identity when one exists, and a completed-session count.
+/// There is no native timestamp and no host clock reading. Gate C-1
+/// removed `remaining_seconds` and the guest-invented `generation`: the
+/// former was only ever decremented by manual `Advance` clicks and so
+/// never tracked real time, and the latter is replaced here by the
+/// host-issued schedule generation (TIMER-F003, TIMER-F008). A paused
+/// session's remainder becomes host-owned, not guest state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Timer {
     mode: Mode,
     configured_seconds: u64,
     completed_sessions: u64,
+    active_schedule: Option<ScheduleHandle>,
 }
 
 impl Default for Timer {
@@ -69,6 +100,7 @@ impl Timer {
             mode: Mode::Idle,
             configured_seconds: 0,
             completed_sessions: 0,
+            active_schedule: None,
         }
     }
 
@@ -79,11 +111,17 @@ impl Timer {
     /// maintain, because its whole purpose is to let `load` detect a
     /// corrupted record rather than have one silently coerced into shape.
     #[must_use]
-    pub const fn from_parts(mode: Mode, configured_seconds: u64, completed_sessions: u64) -> Self {
+    pub const fn from_parts(
+        mode: Mode,
+        configured_seconds: u64,
+        completed_sessions: u64,
+        active_schedule: Option<ScheduleHandle>,
+    ) -> Self {
         Self {
             mode,
             configured_seconds,
             completed_sessions,
+            active_schedule,
         }
     }
 
@@ -100,6 +138,33 @@ impl Timer {
     #[must_use]
     pub const fn completed_sessions(&self) -> u64 {
         self.completed_sessions
+    }
+
+    #[must_use]
+    pub const fn active_schedule(&self) -> Option<ScheduleHandle> {
+        self.active_schedule
+    }
+
+    /// Whether [`Timer::start`] would currently succeed. `app.rs` checks
+    /// this *before* arming a host schedule, so it never creates one for
+    /// a command the model would then reject — the query and the
+    /// mutator's own guard share this one definition, so they cannot
+    /// drift apart.
+    #[must_use]
+    pub const fn can_start(&self) -> bool {
+        matches!(self.mode, Mode::Idle) && self.configured_seconds > 0
+    }
+
+    /// Whether [`Timer::pause`] would currently succeed.
+    #[must_use]
+    pub const fn can_pause(&self) -> bool {
+        matches!(self.mode, Mode::Running)
+    }
+
+    /// Whether [`Timer::resume`] would currently succeed.
+    #[must_use]
+    pub const fn can_resume(&self) -> bool {
+        matches!(self.mode, Mode::Paused)
     }
 
     /// Adjusts the configured duration by `delta` seconds (which may be
@@ -122,68 +187,102 @@ impl Timer {
     }
 
     /// Starts a new session from the configured duration. Idle only, and
-    /// only if a nonzero duration has been configured. Begins a new
-    /// generation: a stale reference to a prior session (e.g. a delayed
-    /// wakeup on a platform with real scheduling) would no longer name the
-    /// active one.
-    pub fn start(&mut self) -> bool {
-        if !matches!(self.mode, Mode::Idle) || self.configured_seconds == 0 {
+    /// only if a nonzero duration has been configured, and only with a
+    /// schedule handle the host has already issued (`app.rs` calls
+    /// `context.time().schedule_after(..)` first; this method never talks
+    /// to the host itself). Returns `false`, touching nothing, if the
+    /// guard fails — `app.rs` must not have armed a host schedule it then
+    /// discards.
+    pub fn start(&mut self, schedule: ScheduleHandle) -> bool {
+        if !self.can_start() {
             return false;
         }
         self.mode = Mode::Running;
+        self.active_schedule = Some(schedule);
         true
     }
 
-    /// Freezes the remaining duration. Running only.
-    pub fn pause(&mut self) -> bool {
-        if !matches!(self.mode, Mode::Running) {
+    /// Freezes the remaining duration. Running only. `schedule` is the
+    /// **new** handle the host returned from pausing — pausing bumps the
+    /// generation (it changes when the schedule would next fire), so the
+    /// pre-pause handle is already stale and must not be kept.
+    pub fn pause(&mut self, schedule: ScheduleHandle) -> bool {
+        if !self.can_pause() {
             return false;
         }
         self.mode = Mode::Paused;
+        self.active_schedule = Some(schedule);
         true
     }
 
     /// Continues counting down from the frozen remaining duration. Paused
-    /// only. No new generation: this is the same session continuing, not a
-    /// new one.
-    pub fn resume(&mut self) -> bool {
-        if !matches!(self.mode, Mode::Paused) {
+    /// only. `schedule` is the new handle the host returned from resuming
+    /// — resuming also bumps the generation, for the same reason pausing
+    /// does.
+    pub fn resume(&mut self, schedule: ScheduleHandle) -> bool {
+        if !self.can_resume() {
             return false;
         }
         self.mode = Mode::Running;
+        self.active_schedule = Some(schedule);
         true
     }
 
-    /// Abandons the active session and returns to Idle at the configured
-    /// duration. Running or Paused only.
+    /// Abandons the active session and returns to Idle. Running or Paused
+    /// only. Takes no handle: `app.rs` reads [`Timer::active_schedule`]
+    /// beforehand to tell the host which schedule to retire, and this
+    /// method only clears the guest's own record of it — the host's
+    /// `cancel` call needs no reply, unlike pause and resume.
     pub fn cancel(&mut self) -> bool {
         if !matches!(self.mode, Mode::Running | Mode::Paused) {
             return false;
         }
         self.mode = Mode::Idle;
+        self.active_schedule = None;
         true
     }
 
-    /// Returns to Idle at the configured duration from any mode, and
-    /// begins a new generation. Unlike `cancel`, this is valid from
+    /// Returns to Idle from any mode. Unlike `cancel`, this is valid from
     /// `Elapsed` too (it is the "start fresh" operation), and unlike
     /// `acknowledge`, it does not require having reached `Elapsed` first.
+    /// As with `cancel`, `app.rs` retires any active host schedule using
+    /// the handle it read before calling this.
     pub fn reset(&mut self) -> bool {
-        let changed = !matches!(self.mode, Mode::Idle);
+        let changed = !matches!(self.mode, Mode::Idle) || self.active_schedule.is_some();
         self.mode = Mode::Idle;
+        self.active_schedule = None;
         changed
     }
 
-    /// Acknowledges an elapsed session and returns to Idle at the
-    /// configured duration. Elapsed only — this is deliberately not the
-    /// same operation as `reset` (see the design's "Elapsed delivery":
-    /// the host would redeliver the event until an equivalent
-    /// acknowledgement commits).
+    /// Acknowledges an elapsed session and returns to Idle. Elapsed only
+    /// — this is deliberately not the same operation as `reset` (see the
+    /// design's "Elapsed delivery": the host would redeliver the event
+    /// until an equivalent acknowledgement commits). No schedule is
+    /// involved: [`Timer::on_elapsed`] already cleared it on the way in.
     pub fn acknowledge(&mut self) -> bool {
         if !matches!(self.mode, Mode::Elapsed) {
             return false;
         }
         self.mode = Mode::Idle;
+        true
+    }
+
+    /// Reacts to an autonomous `ScheduleElapsed` delivery. Running only,
+    /// and only if `matching` names the schedule this timer is actually
+    /// waiting on — the host already guards against stale generations
+    /// before ever invoking the guest (TIMER-F011), but the application
+    /// still checks its own record independently rather than treating any
+    /// delivery as completion by assumption. A mismatch is `false` with
+    /// nothing changed, which `app.rs` treats as a hard error, not a
+    /// silent no-op: it should not be reachable if the host's own guard is
+    /// working.
+    pub fn on_elapsed(&mut self, matching: ScheduleHandle) -> bool {
+        if self.mode != Mode::Running || self.active_schedule != Some(matching) {
+            return false;
+        }
+        self.mode = Mode::Elapsed;
+        self.active_schedule = None;
+        self.completed_sessions = self.completed_sessions.saturating_add(1);
         true
     }
 
@@ -200,50 +299,34 @@ impl Timer {
         format_seconds(self.configured_seconds)
     }
 
-    /// Applies one command, dispatching to the operation methods above.
-    /// `app.rs` calls this from `handle`, exactly as the calculator's
-    /// `Model::apply` does, so both applications share one shape: load,
-    /// clone, apply, compare, save-if-changed.
-    pub fn apply(&mut self, command: Command) {
-        match command {
-            Command::AddSeconds(delta) => {
-                self.add_seconds(delta);
-            }
-            Command::Start => {
-                self.start();
-            }
-            Command::Pause => {
-                self.pause();
-            }
-            Command::Resume => {
-                self.resume();
-            }
-            Command::Cancel => {
-                self.cancel();
-            }
-            Command::Reset => {
-                self.reset();
-            }
-            Command::Acknowledge => {
-                self.acknowledge();
-            }
-            Command::DismissNotice => {}
-        }
-    }
-
     /// Checks the invariants a loaded (and therefore potentially
     /// hand-edited or corrupted) state record must satisfy. Mirrors the
-    /// calculator's defensive `Model::is_valid` check at load time.
+    /// calculator's defensive `Model::is_valid` check at load time, and
+    /// additionally enforces the schedule-identity invariant Gate C-2
+    /// introduced: `Running`/`Paused` always carry a schedule the host
+    /// issued, and `Idle`/`Elapsed` never do — a record with either
+    /// mismatched is corrupt, not a state this application ever produces.
     #[must_use]
     pub const fn is_valid(&self) -> bool {
-        self.configured_seconds <= MAX_SECONDS
+        if self.configured_seconds > MAX_SECONDS {
+            return false;
+        }
+        match self.mode {
+            Mode::Running | Mode::Paused => self.active_schedule.is_some(),
+            Mode::Idle | Mode::Elapsed => self.active_schedule.is_none(),
+        }
     }
 }
 
 /// One user-issued operation on a [`Timer`]. Gate C-1 removed
-/// `Command::Advance`: nothing in this application advances time any more,
-/// and C-2 replaces it with an autonomous host `ScheduleElapsed` delivery
-/// rather than a command.
+/// `Command::Advance`. Gate C-2 gives `Start`/`Pause`/`Resume`/`Cancel`/
+/// `Reset` host meaning: `app.rs` no longer applies these through a single
+/// pure dispatcher (see the removed `Timer::apply`) because each now
+/// requires a host round trip interleaved with the model's own guard
+/// check, and `Start`/`Pause`/`Resume` need the schedule handle the host
+/// returns. Elapsing is no longer a command at all — it arrives as an
+/// autonomous `ScheduleElapsed` delivery and is handled by
+/// [`Timer::on_elapsed`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
     AddSeconds(i64),
@@ -328,7 +411,15 @@ pub const fn migrate_legacy(record: LegacyRecord) -> Migrated {
         Mode::Elapsed => (Mode::Elapsed, false),
     };
     Migrated {
-        model: Timer::from_parts(mode, record.configured_seconds, record.completed_sessions),
+        // Migration never carries a schedule identity forward: a legacy
+        // guest-invented generation was never a host schedule (TIMER-F008),
+        // and idle/elapsed are exactly the modes that require None.
+        model: Timer::from_parts(
+            mode,
+            record.configured_seconds,
+            record.completed_sessions,
+            None,
+        ),
         recovered,
     }
 }
@@ -362,7 +453,7 @@ mod tests {
         assert_eq!(timer.configured_seconds(), MAX_SECONDS);
         assert!(!timer.add_seconds(10), "already at the maximum");
 
-        timer.start();
+        timer.start(handle(1, 1));
         assert!(
             !timer.add_seconds(10),
             "configuration is fixed once started"
@@ -370,58 +461,87 @@ mod tests {
     }
 
     #[test]
-    fn start_requires_idle_and_a_nonzero_duration() {
+    fn start_requires_idle_and_a_nonzero_duration_and_stores_the_handle() {
         let mut timer = Timer::new();
-        assert!(!timer.start(), "nothing configured");
+        assert!(!timer.start(handle(1, 1)), "nothing configured");
 
         timer.add_seconds(60);
-        assert!(timer.start());
+        assert!(timer.start(handle(7, 1)));
         assert_eq!(timer.mode(), Mode::Running);
-        assert!(!timer.start(), "already running");
+        assert_eq!(timer.active_schedule(), Some(handle(7, 1)));
+        assert!(!timer.start(handle(8, 1)), "already running");
+        assert_eq!(
+            timer.active_schedule(),
+            Some(handle(7, 1)),
+            "a rejected start must not overwrite the existing handle"
+        );
     }
 
     #[test]
-    fn pause_and_resume_are_state_gated() {
+    fn pause_and_resume_are_state_gated_and_replace_the_handle() {
         let mut timer = Timer::new();
         timer.add_seconds(60);
-        assert!(!timer.pause(), "idle cannot pause");
+        assert!(!timer.pause(handle(1, 2)), "idle cannot pause");
 
-        timer.start();
-        assert!(timer.pause());
+        timer.start(handle(1, 1));
+        assert!(timer.pause(handle(1, 2)));
         assert_eq!(timer.mode(), Mode::Paused);
-        assert!(!timer.pause(), "already paused");
+        assert_eq!(
+            timer.active_schedule(),
+            Some(handle(1, 2)),
+            "pausing bumped the generation; the guest must hold the new one"
+        );
+        assert!(!timer.pause(handle(1, 3)), "already paused");
 
-        assert!(timer.resume());
+        assert!(timer.resume(handle(1, 3)));
         assert_eq!(timer.mode(), Mode::Running);
-        assert!(!timer.resume(), "already running");
+        assert_eq!(timer.active_schedule(), Some(handle(1, 3)));
+        assert!(!timer.resume(handle(1, 4)), "already running");
     }
 
     #[test]
-    fn cancel_returns_to_idle_from_running_or_paused_only() {
+    fn cancel_returns_to_idle_from_running_or_paused_only_and_clears_the_handle() {
         let mut timer = Timer::new();
         timer.add_seconds(60);
         assert!(!timer.cancel(), "idle has nothing to cancel");
 
-        timer.start();
+        timer.start(handle(1, 1));
         assert!(timer.cancel());
         assert_eq!(timer.mode(), Mode::Idle);
+        assert_eq!(timer.active_schedule(), None);
         assert_eq!(timer.configured_seconds(), 60, "configuration survives");
 
-        timer.start();
-        timer.pause();
+        timer.start(handle(2, 1));
+        timer.pause(handle(2, 2));
         assert!(timer.cancel());
         assert_eq!(timer.mode(), Mode::Idle);
+        assert_eq!(timer.active_schedule(), None);
     }
 
     #[test]
-    fn reset_returns_to_idle_from_any_mode() {
+    fn reset_returns_to_idle_from_any_mode_and_clears_the_handle() {
         let mut timer = Timer::new();
         timer.add_seconds(60);
-        timer.start();
+        timer.start(handle(1, 1));
         assert!(timer.reset());
         assert_eq!(timer.mode(), Mode::Idle);
+        assert_eq!(timer.active_schedule(), None);
         assert_eq!(timer.configured_seconds(), 60);
-        assert!(!timer.reset(), "already idle: nothing changed");
+        assert!(
+            !timer.reset(),
+            "already idle with no handle: nothing changed"
+        );
+    }
+
+    #[test]
+    fn reset_reports_a_change_when_only_the_handle_would_clear() {
+        // A degenerate case `is_valid` would otherwise never let arise in
+        // practice (Idle always implies no handle), included because
+        // `reset`'s "changed" bookkeeping is a separate check from mode
+        // equality and deserves its own coverage.
+        let mut timer = Timer::from_parts(Mode::Idle, 60, 0, Some(handle(9, 1)));
+        assert!(timer.reset());
+        assert_eq!(timer.active_schedule(), None);
     }
 
     #[test]
@@ -429,16 +549,67 @@ mod tests {
         let mut timer = Timer::new();
         timer.add_seconds(60);
         assert!(!timer.acknowledge(), "idle has nothing to acknowledge");
-        timer.start();
+        timer.start(handle(1, 1));
         assert!(!timer.acknowledge(), "running has nothing to acknowledge");
+    }
+
+    #[test]
+    fn on_elapsed_requires_running_and_a_matching_handle() {
+        let mut timer = Timer::new();
+        timer.add_seconds(60);
+        assert!(
+            !timer.on_elapsed(handle(1, 1)),
+            "idle has no active schedule to elapse"
+        );
+
+        timer.start(handle(1, 1));
+        assert!(
+            !timer.on_elapsed(handle(1, 2)),
+            "the host guards against this, but the app must reject it too"
+        );
+        assert_eq!(
+            timer.mode(),
+            Mode::Running,
+            "a rejected delivery must not mutate the timer"
+        );
+
+        assert!(timer.on_elapsed(handle(1, 1)));
+        assert_eq!(timer.mode(), Mode::Elapsed);
+        assert_eq!(timer.active_schedule(), None);
+        assert_eq!(timer.completed_sessions(), 1);
+    }
+
+    #[test]
+    fn on_elapsed_rejects_a_paused_schedule() {
+        // Pausing removes the host deadline entirely, so a paused schedule
+        // cannot become due; a delivery naming one is impossible under a
+        // correct host and must still be refused defensively.
+        let mut timer = Timer::new();
+        timer.add_seconds(60);
+        timer.start(handle(1, 1));
+        timer.pause(handle(1, 2));
+        assert!(!timer.on_elapsed(handle(1, 2)));
+        assert_eq!(timer.mode(), Mode::Paused);
+    }
+
+    #[test]
+    fn is_valid_requires_a_handle_iff_running_or_paused() {
+        assert!(Timer::from_parts(Mode::Idle, 60, 0, None).is_valid());
+        assert!(!Timer::from_parts(Mode::Idle, 60, 0, Some(handle(1, 1))).is_valid());
+        assert!(Timer::from_parts(Mode::Elapsed, 60, 1, None).is_valid());
+        assert!(!Timer::from_parts(Mode::Elapsed, 60, 1, Some(handle(1, 1))).is_valid());
+        assert!(Timer::from_parts(Mode::Running, 60, 0, Some(handle(1, 1))).is_valid());
+        assert!(!Timer::from_parts(Mode::Running, 60, 0, None).is_valid());
+        assert!(Timer::from_parts(Mode::Paused, 60, 0, Some(handle(1, 1))).is_valid());
+        assert!(!Timer::from_parts(Mode::Paused, 60, 0, None).is_valid());
     }
 
     #[test]
     fn completed_sessions_are_preserved_across_transitions() {
         // Sessions are application meaning, distinct from any host
-        // schedule generation (TIMER-F008). Nothing in C-1 increments
-        // them, since nothing elapses; C-2 does so on ScheduleElapsed.
-        let timer = Timer::from_parts(Mode::Elapsed, 300, 7);
+        // schedule generation (TIMER-F008). Only on_elapsed increments
+        // them.
+        let timer = Timer::from_parts(Mode::Elapsed, 300, 7, None);
         assert_eq!(timer.completed_sessions(), 7);
         let mut timer = timer;
         assert!(timer.reset());
@@ -457,8 +628,8 @@ mod tests {
 
     #[test]
     fn is_valid_rejects_an_out_of_range_configuration() {
-        assert!(Timer::from_parts(Mode::Idle, MAX_SECONDS, 0).is_valid());
-        assert!(!Timer::from_parts(Mode::Idle, MAX_SECONDS + 1, 0).is_valid());
+        assert!(Timer::from_parts(Mode::Idle, MAX_SECONDS, 0, None).is_valid());
+        assert!(!Timer::from_parts(Mode::Idle, MAX_SECONDS + 1, 0, None).is_valid());
     }
 
     #[test]
@@ -470,22 +641,24 @@ mod tests {
     }
 
     #[test]
-    fn apply_dispatches_every_command() {
+    fn a_full_session_life_cycle_holds_the_invariant_throughout() {
         let mut timer = Timer::new();
-        timer.apply(Command::AddSeconds(120));
-        assert_eq!(timer.configured_seconds(), 120);
-        timer.apply(Command::Start);
-        assert_eq!(timer.mode(), Mode::Running);
-        timer.apply(Command::Pause);
-        assert_eq!(timer.mode(), Mode::Paused);
-        timer.apply(Command::Resume);
-        assert_eq!(timer.mode(), Mode::Running);
-        timer.apply(Command::Cancel);
-        assert_eq!(timer.mode(), Mode::Idle);
-        timer.apply(Command::Reset);
-        assert_eq!(timer.mode(), Mode::Idle);
-        timer.apply(Command::Acknowledge);
-        assert_eq!(timer.mode(), Mode::Idle);
+        timer.add_seconds(300);
+        assert!(timer.is_valid());
+        timer.start(handle(1, 1));
+        assert!(timer.is_valid());
+        timer.pause(handle(1, 2));
+        assert!(timer.is_valid());
+        timer.resume(handle(1, 3));
+        assert!(timer.is_valid());
+        assert!(timer.on_elapsed(handle(1, 3)));
+        assert!(timer.is_valid());
+        assert!(timer.acknowledge());
+        assert!(timer.is_valid());
+    }
+
+    fn handle(id: u64, generation: u64) -> ScheduleHandle {
+        ScheduleHandle { id, generation }
     }
 
     fn legacy(mode: Mode, configured: u64, sessions: u64) -> LegacyRecord {
@@ -502,6 +675,7 @@ mod tests {
         assert_eq!(out.model.mode(), Mode::Idle);
         assert_eq!(out.model.configured_seconds(), 300);
         assert_eq!(out.model.completed_sessions(), 4);
+        assert_eq!(out.model.active_schedule(), None);
         assert!(!out.recovered);
     }
 
@@ -513,6 +687,11 @@ mod tests {
         assert_eq!(out.model.mode(), Mode::Idle, "no deadline is invented");
         assert_eq!(out.model.configured_seconds(), 300);
         assert_eq!(out.model.completed_sessions(), 2);
+        assert_eq!(
+            out.model.active_schedule(),
+            None,
+            "a legacy guest-invented generation is never reused as a host schedule identity"
+        );
         assert!(out.recovered, "the user must be told it was reset");
     }
 
@@ -521,6 +700,7 @@ mod tests {
         let out = migrate_legacy(legacy(Mode::Paused, 90, 1));
         assert_eq!(out.model.mode(), Mode::Idle);
         assert_eq!(out.model.configured_seconds(), 90);
+        assert_eq!(out.model.active_schedule(), None);
         assert!(out.recovered);
     }
 

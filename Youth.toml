@@ -1,7 +1,7 @@
 [app]
 id = "dev.saman.timer"
 name = "Youth Timer"
-protocol = "0.0.3"
+protocol = "0.0.4"
 
 [build]
 language = "rust"

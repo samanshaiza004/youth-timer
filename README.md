@@ -1,7 +1,7 @@
 # Youth Timer
 
 The second Youth Utility Suite application, maintained as a standalone
-repository. It targets protocol `0.0.3` and the exact SDK revision in
+repository. It targets protocol `0.0.4` and the exact SDK revision in
 `Youth.lock`.
 
 ```text
@@ -11,38 +11,48 @@ youth dev
 youth build --release
 ```
 
-## What this app is (Gate A)
+## What this app is (Gate C-2)
 
-This is a **Gate A** proof: it exercises the Timer domain model and command
-surface with today's Youth capabilities, and nothing more. Read that
-plainly — **it does not count down on its own.** Youth exposes no clock, no
-tick, and no scheduled wakeup to a guest application. Every advance of the
-countdown, including the two "Advance 1s" / "Advance 10s" buttons in the
-window, is an explicit command standing in for a host clock that does not
-exist yet.
+`Start`, `Pause`, `Resume`, `Cancel`, and `Reset` each perform a real host
+schedule operation through `context.time()` — no clock, tick, or elapsed
+delivery is guest-owned or guest-invented. The host issues schedule
+identity (`id` + `generation`); this app stores exactly what the host
+returns and never fabricates or mutates a generation itself. An autonomous
+`ScheduleElapsed` delivery — the host waking this application because a
+schedule became due, not a button press — is handled by `handle_elapsed`,
+which requires an exact match against the stored schedule handle and
+returns an application error on any mismatch rather than silently
+no-opping.
 
-That is the point of building it. `FINDINGS.md` records exactly what a real
-timer would need — a `youth:time` capability owning clocks, sleeping,
-durable scheduling, host-rendered countdown presentation, and notification —
-and what, separately, turned out to need no new capability at all (the mode
-machine, bounded configuration, session counting, and the full command and
-shortcut surface all built cleanly on the existing SDK).
+`FINDINGS.md` records what remains open: this repository's own test suite
+can prove declaration, persistence, and identity-across-restart (see
+`tests/basic.youth-test` and `tests/migration_then_start.youth-test`), but
+cannot itself wait on real elapsed time or fire a virtual-clock wake, so
+`ScheduleElapsed` delivery and overdue-reconciliation-across-a-closed-process
+are proven by review and by Youth's own workspace tests, not by an
+end-to-end test from this repo. Host-owned countdown presentation and
+native notification are Gate C-3 and Gate D, not yet built.
 
 ## The model
 
-Durable state is the canonical timer model — mode, configured duration,
-remaining duration, generation, and completed-session count — never a
-derived display string. `view` and `handle` share one `display()` formatter
-and one `ButtonEnabled` computation, so the countdown text and every
-control's enabled state can never disagree between the two. `Timer::apply`
-is the single place a command changes the model; `view` and `handle` never
-duplicate that logic.
+`src/model.rs` is a pure, host-agnostic domain model: mode, configured
+duration, completed-session count, and an `Option<ScheduleHandle>` mirroring
+the host's real schedule identity when one is active — never a guest-derived
+remaining-time value. `view` and `handle` share one `present`/`present_update`
+pair, itself driven by one `ButtonEnabled::compute` — so the countdown text
+and every control's enabled state can never disagree between the two.
+`app.rs`'s `apply_command` is the only place a command touches both the host
+and the model, and it always performs the host schedule operation first,
+the model transition second, and persistence last, inside one turn: if the
+host call fails, the model never changes and nothing is written.
 
 Four modes: Idle (configuring), Running, Paused, Elapsed. Configuring is
 possible only while Idle, bounded to `[00:00, 99:59]`. Starting requires a
-nonzero configured duration and begins a new generation. Acknowledging an
-elapsed session is a separate step from resetting one, matching the
-design's distinction between the two.
+nonzero configured duration and creates a schedule. Running and Paused
+require an active schedule handle; Idle and Elapsed require its absence —
+enforced by `Timer::is_valid`. Acknowledging an elapsed session is a
+separate step from resetting one, matching the design's distinction between
+the two.
 
 ## Controls
 
@@ -54,7 +64,6 @@ design's distinction between the two.
 | Resume | `u` | Paused |
 | Cancel | Escape | Running or Paused |
 | Reset | Backspace | Whenever there is something to reset |
-| Advance 1s / Advance 10s | `a` / `k` | Running only — the manual clock stand-in |
 | Acknowledge | `o` | Elapsed |
 
 Every command is bound through `Button::command`/`Events::commanded`; Tab
@@ -65,21 +74,22 @@ activation (see `FINDINGS.md`, TIMER-F010) — every command independently
 rejects itself when the mode does not allow it, so the app does not rely on
 the UI's presentation as access control.
 
-## Release evidence (Gate A)
+## Release evidence (Gate C-2)
 
 These are the metrics this stage can actually produce; see `FINDINGS.md` for
 which of the design's metrics (turn latency, boundary bytes, state-commit
-latency, memory, idle CPU) have nothing autonomous to measure yet, and are
-therefore not published here rather than published as misleading zeros.
+latency, memory, idle CPU) still have nothing autonomous exercised from this
+repo's own tests, and are therefore not published here rather than
+published as misleading zeros.
 
 | Metric | Value |
 | --- | --- |
-| Debug component size | 5,555,544 bytes |
-| Release component size | 107,696 bytes |
-| Release component SHA-256 | `41cca4f7fd2b1bf205cea0291d091a5147594472492ed680f55640b1a9f1526f` |
+| Debug component size | 5,841,230 bytes |
+| Release component size | 120,642 bytes |
+| Release component SHA-256 | `7684dea5155d3b5d39c61eef7ae38246cdf9fa7ffe507fcf0fe6b904b419932e` |
 | Raw WIT concepts exposed to the app | 0 |
 | Native accessibility projection | 0% (unchanged from the platform baseline) |
-| Platform, build | macOS/arm64, `youth-cli 0.0.2`, protocol `0.0.3`, warm dependency cache |
+| Platform, build | macOS/arm64, protocol `0.0.4`, warm dependency cache |
 
 The release build above ran with an already-populated Cargo registry cache
 (this repository had already been checked and tested), so it is not a
@@ -96,24 +106,24 @@ binding source. Rust bindings and export plumbing come only from the exact
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT license](LICENSE-MIT) at your option.
 
-## Gate C-1: no tick source
+## Migrating from an earlier install
 
-This application is mid-migration. Gate A stood in for Youth's missing
-clock with manual **Advance** buttons; Gate C-1 deleted them, along with
-the `remaining_seconds` they moved, because that value was only ever
-changed by button presses and never tracked real time — carrying it
-forward would have preserved a fiction.
+An application-state schema version (`model-schema-version`) was added at
+Gate C-1. A durable record written by an earlier version of this app —
+Gate A's manual-advance model, with its guest-owned `remaining_seconds` and
+`generation` — is detected on load, never trusted as real progress, and
+rewritten on the first event this version successfully handles (not only
+the first one that changes the model — dismissing a recovery notice alone
+completes a pending rewrite). A stored `running` or `paused` session
+becomes idle at its configured duration with a recovery notice, because no
+durable deadline ever existed for it and inventing one would be dishonest.
+Completed-session counts survive. Once migrated, the legacy keys are
+deleted and never reused.
 
-So right now **nothing advances time**. Configuring a duration, starting,
-pausing, resuming, cancelling, resetting, session counting, and durable
-persistence across a restart all work. The countdown shows the configured
-duration and stays there. `Start` still enters Running deliberately: the
-mode machine is intact and Gate C-2 gives it meaning by arming a real host
-schedule through `context.time()` and reacting to an autonomous
-`ScheduleElapsed` delivery.
+## Gate C-3 and Gate D: not yet built
 
-Upgrading from a Gate A install is handled: a stored `running` or `paused`
-session is reset to idle at its configured duration and the app shows a
-recovery notice, because no durable deadline ever existed and inventing
-one would be dishonest. Completed-session counts survive.
+The countdown text currently shows the configured duration, not a live
+countdown driven by host-owned temporal presentation — that is Gate C-3.
+Native notification on elapse is Gate D. See `FINDINGS.md`, TIMER-F004 and
+TIMER-F006.
 

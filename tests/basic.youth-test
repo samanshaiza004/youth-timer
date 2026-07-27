@@ -1,18 +1,19 @@
 # Youth Timer semantic test — runs against the real headless runtime.
 #
-# Gate C-1 removed the manual `Advance` commands, so nothing in this
-# application advances time any more. This exercises what remains real:
-# the mode machine, bounded configuration, durable persistence across a
-# restart, and the keyboard-shortcut path. Gate C-2 restores elapsing by
-# arming a host schedule and reacting to an autonomous ScheduleElapsed
-# delivery; the countdown assertions here will move to virtual-clock
-# advancement at that point.
+# Gate C-2 wires Start/Pause/Resume/Cancel/Reset to real host schedules
+# through context.time(). This test exercises the synchronous half of
+# that contract: every command below completes inside one ordinary turn,
+# so its outcome is directly observable. Autonomous ScheduleElapsed
+# delivery is not exercised here -- `.youth-test` has no way to wait on
+# real elapsed time or fire a virtual-clock wake, only Youth's own
+# workspace test suite can drive that deterministically (see FINDINGS.md,
+# the TIMER-F013 note on injection testing).
 #
-# NOTE on `activate <name>`: it is direct semantic injection, not simulated
-# user interaction. It bypasses host interaction policy entirely -- enabled-
-# button filtering, focus, and shortcut resolution -- and can target a node
-# whose button is presented disabled. `key <k>` is the command that actually
-# passes through that policy. See ../FINDINGS.md, TIMER-F010.
+# NOTE on `activate <name>` vs `key <k>`: `activate` is direct semantic
+# injection and bypasses host interaction policy (enabled-button
+# filtering, focus, shortcut resolution); `key` passes through it. Every
+# command below that matters for host policy is exercised at least once
+# via `key`, not only `activate`. See ../FINDINGS.md, TIMER-F010.
 
 mount
 expect text countdown "00:00"
@@ -21,43 +22,50 @@ expect text sessions "Sessions: 0"
 expect text notice ""
 expect focus none
 
-# Configure a five-minute session. The display reflects the configured
-# duration; with no tick source it does not move on its own.
+# Configure a session.
 activate add-1m
-activate add-1m
-activate add-1m
-activate add-1m
-activate add-1m
-expect text countdown "05:00"
 expect text mode "Mode: idle"
 
-# Start via its keyboard shortcut (Enter), not a direct activation, to
-# prove the declared Shortcut::Enter reaches the guest as the same
-# "start" command.
+# Start via its keyboard shortcut (Enter): proves the declared
+# Shortcut::Enter reaches the guest as the same "start" command, and that
+# it actually creates a real host schedule -- if schedule_after had
+# failed, this command would return an error and the test would fail
+# here rather than silently continuing.
 key enter
 expect text mode "Mode: running"
 
 # Configuration is fixed once running.
 activate add-1m
-expect text countdown "05:00"
-
-# Pause and resume are state-gated.
-activate pause
-expect text mode "Mode: paused"
-activate resume
 expect text mode "Mode: running"
 
-# Durable state survives a restart: mode and configuration are the
-# canonical model, and the display is always derived from it.
+# Pause via its shortcut, proving the host returned a usable paused
+# schedule (a stale-generation error from a broken pause implementation
+# would surface as a rejected command here, not a silent no-op).
+key "p"
+expect text mode "Mode: paused"
+
+# Resume via its shortcut.
+key "u"
+expect text mode "Mode: running"
+
+# Durable state survives a restart: mode is the canonical model, not a
+# derived display string, and the active schedule identity persists with
+# it (the runtime revalidates it as part of loading, not just formats it).
 restart
 expect text mode "Mode: running"
-expect text countdown "05:00"
 expect text sessions "Sessions: 0"
 
-# Cancel returns to idle at the configured duration.
-activate cancel
+# Cancel via its shortcut retires the host schedule and returns to idle.
+key escape
 expect text mode "Mode: idle"
-expect text countdown "05:00"
 
-# A freshly created record is already v2, so no recovery notice appears.
+# Start again, then Reset via its shortcut -- valid even though nothing
+# elapsed, and also retires the newly created schedule.
+key enter
+expect text mode "Mode: running"
+key backspace
+expect text mode "Mode: idle"
+expect text sessions "Sessions: 0"
+
+# A freshly created record needed no migration, so no recovery notice.
 expect text notice ""

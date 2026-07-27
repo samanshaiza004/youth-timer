@@ -1,0 +1,57 @@
+# Gate C-2's strongest integration test: a legacy (Gate A) durable
+# record whose *first* interaction after upgrading is Start. This proves
+# the deferred-migration policy composes with real schedule creation --
+# both happen inside the very same turn, atomically -- rather than
+# requiring a dedicated "migrate first" step before the app is otherwise
+# usable (TIMER-F012).
+#
+# Seeded record matches exactly what Gate A would have written for a
+# five-minute session that was Running when the process last exited:
+# mode="running", configured-seconds=300, remaining-seconds=37 (whatever
+# it happened to be -- irrelevant, since migration must never read this
+# value as real progress), generation=4 (Gate A's guest-invented
+# counter), completed-sessions=2. No model-schema-version key at all,
+# which is exactly what marks a record as legacy v1.
+
+state text "mode" "running"
+state integer "configured-seconds" 300
+state integer "remaining-seconds" 37
+state integer "generation" 4
+state integer "completed-sessions" 2
+
+mount
+
+# Migration must never fabricate a deadline: a legacy "running" record
+# becomes idle at its configured duration, with a recovery notice.
+expect text mode "Mode: idle"
+expect text countdown "05:00"
+expect text sessions "Sessions: 2"
+expect text notice "Recovered from an earlier version: the running timer was reset."
+
+# Nothing has been rewritten yet: view's state handle is read-only
+# (TIMER-F012), so the legacy keys are still exactly where they were.
+expect state integer "remaining-seconds" 37
+expect state integer "generation" 4
+expect state missing "model-schema-version"
+
+# Start is the first *handled* event. In one turn it must: normalize and
+# rewrite the durable record to v2, delete every legacy key, create a
+# real host schedule, and store the returned identity -- or none of it,
+# if anything failed.
+key enter
+expect text mode "Mode: running"
+expect text sessions "Sessions: 2"
+
+# The rewrite happened.
+expect state integer "model-schema-version" 2
+expect state missing "remaining-seconds"
+expect state missing "generation"
+
+# Sessions -- real application meaning -- survived the whole trip intact.
+expect text sessions "Sessions: 2"
+
+# Restarting proves the schedule identity itself was durably committed,
+# not merely the mode text: the runtime revalidates it against Youth's
+# own schedule storage when the app remounts.
+restart
+expect text mode "Mode: running"

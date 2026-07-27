@@ -1,0 +1,27 @@
+# Dismissing the recovery notice touches no timer domain state, but must
+# still complete a pending migration -- because migration completes on
+# *any* successfully handled event, not only ones that change the model
+# (the same rule that makes a no-op command finish an outstanding
+# rewrite rather than leaving it pending forever).
+
+state text "mode" "paused"
+state integer "configured-seconds" 120
+state integer "remaining-seconds" 45
+state integer "generation" 9
+state integer "completed-sessions" 0
+
+mount
+expect text mode "Mode: idle"
+expect text notice "Recovered from an earlier version: the running timer was reset."
+expect state missing "model-schema-version"
+
+# Dismiss changes nothing about the timer's mode or configuration.
+activate dismiss
+expect text mode "Mode: idle"
+expect text countdown "02:00"
+expect text notice ""
+
+# But the durable rewrite completed anyway.
+expect state integer "model-schema-version" 2
+expect state missing "remaining-seconds"
+expect state missing "generation"
