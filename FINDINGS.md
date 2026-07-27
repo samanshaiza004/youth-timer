@@ -31,6 +31,25 @@ Not needed:
   - a different persistence API
 ```
 
+## Gate B has landed in the platform; this app has not migrated
+
+Youth implemented `youth:time@0.0.1` and durable scheduling in Gate B
+(Developer Preview 2). That changes the *platform* answer to several
+findings below, but **this application still runs the Gate A design** —
+every tick is still an explicit `Advance` command. Findings therefore
+keep their Gate A status except where the finding was purely a question
+about host architecture:
+
+- **TIMER-F011 is closed.** It asked who owns a schedule when no guest
+  instance is mounted, which was answerable without the app changing.
+- **TIMER-F001, F002, F003, F007, F008** now have platform answers
+  (declarative scheduling, host-initiated delivery, host-owned schedule
+  state, overdue reconciliation, host-issued generations), but remain
+  open *as application evidence* until the Timer adopts `context.time()`
+  and deletes its manual-advance path (TIMER-F003's deletion list).
+- **TIMER-F004 and F006** are untouched: host-owned countdown
+  presentation and notification are Gate C and Gate D.
+
 ## Open findings
 
 | ID | Summary | Next decision |
@@ -43,7 +62,6 @@ Not needed:
 | TIMER-F006 | No native notification effect on elapse | Decision recorded: attach a bounded notification descriptor to the schedule, not a general effects API |
 | TIMER-F007 | No durable schedule or overdue recovery across process exit | Same; `restart` proves app-state persistence, not real-time reconciliation |
 | TIMER-F008 | Generations are expressible as state but stale-delivery is untestable without real scheduling | Schedule generation must be host-issued identity, distinct from any guest session counter |
-| TIMER-F011 | Schedule ownership across app unloading is undefined | Gate B schedule-storage work must decide this before host-initiated delivery is built on top of it |
 
 ## Findings index
 
@@ -59,7 +77,7 @@ Not needed:
 | TIMER-F008 | Generations expressible but stale-delivery untestable | Open (boundary confirmation) | Schedule generation must be host-issued, not conflated with an app session counter |
 | TIMER-F009 | Mode machine, bounded configuration, sessions, commands, and shortcuts are fully expressible today | Addressed (positive boundary confirmation) | The non-temporal design surface needs no new protocol — see "The main result" above |
 | TIMER-F010 | The host does not enforce a button's `enabled` flag on activation; it is presentation only | Addressed (boundary confirmation) | The guest must self-guard every command; test DSL naming (`activate` vs. a future `click`) recorded |
-| TIMER-F011 | Schedule ownership across app unloading is undefined | Open | "Temporarily unloaded" currently has no representation distinct from "process exited" |
+| TIMER-F011 | Schedule ownership across app unloading is undefined | Addressed (Gate B) | The host owns schedule existence, due detection, and pending delivery; the guest owns only its transactional reaction |
 
 ## Suggested Gate B priority
 
@@ -744,7 +762,7 @@ yet settled:
 
 ## TIMER-F011 — Schedule ownership across app unloading is undefined
 
-- **Status:** Open
+- **Status:** Addressed by Gate B (Youth `97d7b3b`)
 - **Observed:** 2026-07-23
 - **Application:** Youth Timer
 - **Workflow stage:** Design-document review against `crates/youth-runtime`
@@ -794,9 +812,30 @@ yet settled:
   into "process exited" — i.e., the design's minimized/unfocused case
   would only work by accident of the instance happening to still be
   spawned, not because anything guarantees it.
-- **Resolution:** None yet. Recorded as a Gate B finding because the
-  design's own distinction between "Youth running" (background) and
-  "Youth process exited" (overdue) assumes an intermediate state the
-  current runtime has no representation for; Gate B schedule-storage work
-  should decide this before building host-initiated delivery on top of
-  it, not after.
+- **Resolution:** **Addressed by Gate B** in the Youth workspace
+  (`95c983e`, `6d29a50`, `a924c92`, `97d7b3b`). Ownership is now
+  explicit:
+
+  > Schedule creation, persistence, due detection, wake validation,
+  > pending delivery, and delivery acknowledgement are host-owned. The
+  > guest owns only its transactional semantic reaction.
+
+  Concretely: schedules live in the application's own state database and
+  are readable with no runtime, no engine, and no guest instantiated
+  (`StateStore::open`), so a schedule exists independently of any spawned
+  `YouthAppHandle`. Due detection and pending-delivery creation require
+  no live guest at all — guest availability determines only when a
+  pending delivery may be *consumed*. A fired wake carries no authority:
+  it enters the worker's single FIFO mailbox and is revalidated against
+  durable state before any guest turn is constructed, because a pause,
+  resume, or cancel may have committed after it was armed.
+  Acknowledgement is a write inside the same SQLite transaction that
+  commits the guest's state and installs its tree, so at-least-once is a
+  storage guarantee rather than a convention.
+
+  The intermediate state this finding named — "instance gone, state
+  alive" — now has a representation. What remains genuinely open is
+  narrower and is *policy*, not architecture: whether Youth should
+  auto-mount an unloaded application to consume a pending delivery, or
+  hold it until the app is next opened. DP2 deliberately defers that
+  (decision D4g); today the delivery is retained.
