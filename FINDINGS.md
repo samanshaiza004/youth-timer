@@ -77,6 +77,8 @@ about host architecture:
 | TIMER-F008 | Generations expressible but stale-delivery untestable | Open (boundary confirmation) | Schedule generation must be host-issued, not conflated with an app session counter |
 | TIMER-F009 | Mode machine, bounded configuration, sessions, commands, and shortcuts are fully expressible today | Addressed (positive boundary confirmation) | The non-temporal design surface needs no new protocol — see "The main result" above |
 | TIMER-F010 | The host does not enforce a button's `enabled` flag on activation; it is presentation only | Addressed (boundary confirmation) | The guest must self-guard every command; test DSL naming (`activate` vs. a future `click`) recorded |
+| TIMER-F013 | The `.youth-test` DSL cannot seed pre-existing durable state, so migration paths cannot be integration-tested | Open | Migration correctness rests on unit tests plus review rather than end-to-end evidence |
+| TIMER-F012 | An application cannot migrate its own durable state at load time; `view` is read-only | Open | Migration must defer to the first event turn, so legacy interpretation can never be retired on the app's own schedule |
 | TIMER-F011 | Schedule ownership across app unloading is undefined | Addressed (Gate B) | The host owns schedule existence, due detection, and pending delivery; the guest owns only its transactional reaction |
 
 ## Suggested Gate B priority
@@ -839,3 +841,107 @@ yet settled:
   auto-mount an unloaded application to consume a pending delivery, or
   hold it until the app is next opened. DP2 deliberately defers that
   (decision D4g); today the delivery is retained.
+
+## TIMER-F012 — An application cannot migrate its own durable state at load time
+
+- **Status:** Open
+- **Observed:** 2026-07-27
+- **Application:** Youth Timer
+- **Workflow stage:** Gate C-1 application-state migration design
+- **Platform:** macOS, SDK revision `8696bd97`
+- **Local path:** `/Users/keina/dev/youth-timer`
+- **Commit:** Gate C-1
+- **Evidence:** `Application::view` receives a `ViewContext`, whose
+  `state()` returns a **read-only** `StateReader`. `delete` and every
+  `set_*` exist only on `StateWriter`, reachable solely through
+  `EventContext` in `handle` (`youth-sdk` `lib.rs`: `StateReader`'s impl
+  carries only `boolean`/`integer`/`text`/`bytes`; `delete` is at line
+  595 inside `StateWriter`). `view` is used for **both** mount and
+  resync, and resync is a read-only phase at the runtime boundary, so the
+  SDK cannot widen it without breaking that invariant.
+- **Developer impact:** An application that needs to rewrite its durable
+  representation on upgrade — add a schema version, drop obsolete keys,
+  reclassify a legacy record — **cannot do so when its state is first
+  read**. Migration must be deferred to the first event turn. The
+  consequence is that an application opened but never interacted with
+  never completes its durable migration, so `load` must be able to
+  *interpret* every legacy shape correctly and indefinitely, not merely
+  survive one upgrade.
+- **What could not be expressed:** A migration that runs once, at load,
+  and durably normalizes state before any UI is presented.
+- **What felt repetitive:** Every read path must carry legacy
+  interpretation for as long as legacy records may exist, because there
+  is no point at which the application can guarantee it has rewritten
+  them.
+- **What leaked WIT details:** None.
+- **What required host policy:** Whether `mount` should be able to write
+  durable state through the SDK. The runtime already treats `Mount` as a
+  writable phase (`GuestCallPhase::writable()` is true for `Mount` and
+  `Handle`), so the restriction is an **SDK** boundary rather than a
+  protocol one — `view` is shared by mount and resync and is therefore
+  typed to the weaker of the two.
+- **Unavoidable protocol addition:** None. This is an SDK API-shape
+  question. Options include a distinct mount-time entry point with
+  writable state, or an explicit `migrate` hook invoked once per mount.
+  This app does not need one to be correct — deferring to the first
+  handle works — but the workaround should be a recorded decision rather
+  than folklore.
+- **What remains SDK/application behavior:** Classification and policy
+  are application-owned regardless. Only *when* an application may write
+  is at issue.
+- **Impact:** Correctness is preserved (this app normalizes in memory on
+  every read), but the durable rewrite is not guaranteed to happen at any
+  particular time, and legacy interpretation code cannot ever be deleted
+  on a schedule the application controls.
+- **Resolution:** Worked around in Gate C-1: `load` interprets legacy and
+  v2 records identically and reports whether a durable rewrite is
+  pending; `save`, which only runs in `handle`, writes the v2 shape and
+  deletes the legacy keys. Migration therefore completes on the first
+  command after upgrade, and is idempotent because `load` always
+  normalizes.
+
+## TIMER-F013 — The test DSL cannot seed pre-existing durable state
+
+- **Status:** Open
+- **Observed:** 2026-07-27
+- **Application:** Youth Timer
+- **Workflow stage:** Gate C-1 migration testing
+- **Platform:** macOS, headless `youth test`
+- **Local path:** `/Users/keina/dev/youth-timer`
+- **Commit:** Gate C-1
+- **Evidence:** `.youth-test` offers `mount`, `restart`, `activate`,
+  `key`, `expect text`, and `expect focus`. Every one of them operates on
+  an application that started from an **empty** state file — the runner
+  creates a fresh temporary `state.sqlite3` per test file. There is no
+  command that writes a durable record before `mount`.
+- **Developer impact:** An application cannot integration-test any code
+  path that only runs against state written by an *earlier version of
+  itself*. Migration is exactly that path. This app can prove its
+  migration policy is correct as a pure function (`migrate_legacy` in
+  `src/model.rs`, six unit tests), and can prove a fresh v2 record works
+  end to end, but **cannot** prove through the real runtime that a
+  genuine legacy record is read, rewritten, and has its legacy keys
+  deleted.
+- **What could not be expressed:** "Given this durable state, mount and
+  assert." Youth's own workspace tests do exactly this for the
+  `youth:state` v1→v2 migration by constructing a legacy database
+  directly — an application repository has no equivalent.
+- **What felt repetitive:** N/A.
+- **What leaked WIT details:** None.
+- **What required host policy:** Whether the test DSL should be able to
+  seed state, and if so in what representation. A `state set <key>
+  <value>` command would leak the storage model into the test language,
+  which the DSL has so far deliberately avoided. A better shape may be
+  seeding from a fixture file, or a `given state <file>` prelude.
+- **Unavoidable protocol addition:** None; this is test tooling in
+  `crates/youth-test`.
+- **What remains SDK/application behavior:** Migration policy is
+  application-owned and is unit-testable if the application keeps it in a
+  pure module, which is the workaround adopted here.
+- **Impact:** Migration correctness rests on unit tests plus review, not
+  on end-to-end evidence. For an operation whose entire purpose is to
+  handle records this version of the code never wrote, that is a real
+  coverage gap.
+- **Resolution:** None yet. Worked around by extracting `migrate_legacy`
+  into the pure model so the policy is host-testable, and by keeping
+  state I/O in `app.rs` thin enough to review.

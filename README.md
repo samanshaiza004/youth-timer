@@ -95,3 +95,25 @@ binding source. Rust bindings and export plumbing come only from the exact
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT license](LICENSE-MIT) at your option.
+
+## Gate C-1: no tick source
+
+This application is mid-migration. Gate A stood in for Youth's missing
+clock with manual **Advance** buttons; Gate C-1 deleted them, along with
+the `remaining_seconds` they moved, because that value was only ever
+changed by button presses and never tracked real time — carrying it
+forward would have preserved a fiction.
+
+So right now **nothing advances time**. Configuring a duration, starting,
+pausing, resuming, cancelling, resetting, session counting, and durable
+persistence across a restart all work. The countdown shows the configured
+duration and stays there. `Start` still enters Running deliberately: the
+mode machine is intact and Gate C-2 gives it meaning by arming a real host
+schedule through `context.time()` and reacting to an autonomous
+`ScheduleElapsed` delivery.
+
+Upgrading from a Gate A install is handled: a stored `running` or `paused`
+session is reset to idle at its configured duration and the app shows a
+recovery notice, because no durable deadline ever existed and inventing
+one would be dishonest. Completed-session counts survive.
+

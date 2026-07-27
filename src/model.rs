@@ -6,16 +6,20 @@
 //! tested core, and `app.rs` is a thin adapter that reads/writes it through
 //! typed state and renders it through the SDK's builders.
 //!
-//! # Why time is a manual step, not a clock
+//! # Gate C-1: no tick source
 //!
-//! Current Youth exposes no clock, tick, or scheduled wakeup to a guest
-//! (see `../FINDINGS.md`, TIMER-F001/F002). `advance` stands in for the
-//! host-owned clock the design calls for: it is the one operation that
-//! would, on a platform with `youth:time`, be driven by a host schedule
-//! instead of a button or a test command. Everything else here — the mode
-//! machine, bounded configuration, session counting, and formatting — is
-//! genuinely expressible today and is exercised by the tests below and by
-//! `tests/basic.youth-test` against the real headless runtime.
+//! Gate A stood in for the missing host clock with manual `Advance`
+//! commands. Gate C-1 deleted them, along with the `remaining_seconds`
+//! they decremented, because that value was only ever moved by button
+//! presses and so never corresponded to real elapsed time — carrying it
+//! forward would have preserved a fiction (see `../FINDINGS.md`,
+//! TIMER-F003).
+//!
+//! This model therefore has **no way to advance time**. Modes,
+//! bounded configuration, session counting, and persistence still work;
+//! nothing counts down. Gate C-2 restores that by arming a real host
+//! schedule through `context.time()` and reacting to an autonomous
+//! `ScheduleElapsed` delivery.
 
 /// The Timer's application mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,24 +39,20 @@ pub enum Mode {
 /// design's seconds-precision bound and the `MM:SS` display format.
 pub const MAX_SECONDS: u64 = 99 * 60 + 59;
 
-/// The default step size for the manual "advance" commands.
-pub const ADVANCE_SMALL_SECONDS: u64 = 1;
-pub const ADVANCE_LARGE_SECONDS: u64 = 10;
-
 /// The canonical, durable application state.
 ///
-/// Every field here is exactly what the design's "Application model"
-/// section says the guest should persist: mode, configured duration, an
-/// opaque generation, and a completed-session count. There is no field for
-/// a native timestamp or a host clock reading, because none exists to
-/// persist (TIMER-F003 records the consequence: `remaining_seconds` has to
-/// live here today, standing in for what a host schedule would own).
+/// Every field here is what the design's "Application model" section says
+/// the guest should persist: mode, configured duration, and a
+/// completed-session count. There is no native timestamp and no host clock
+/// reading. Gate C-1 removed `remaining_seconds` and the guest-invented
+/// `generation`: the former was only ever decremented by manual `Advance`
+/// clicks and so never tracked real time, and the latter is replaced by a
+/// host-issued schedule generation in C-2 (TIMER-F003, TIMER-F008). A
+/// paused session's remainder becomes host-owned, not guest state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Timer {
     mode: Mode,
     configured_seconds: u64,
-    remaining_seconds: u64,
-    generation: u64,
     completed_sessions: u64,
 }
 
@@ -68,8 +68,6 @@ impl Timer {
         Self {
             mode: Mode::Idle,
             configured_seconds: 0,
-            remaining_seconds: 0,
-            generation: 0,
             completed_sessions: 0,
         }
     }
@@ -81,18 +79,10 @@ impl Timer {
     /// maintain, because its whole purpose is to let `load` detect a
     /// corrupted record rather than have one silently coerced into shape.
     #[must_use]
-    pub const fn from_parts(
-        mode: Mode,
-        configured_seconds: u64,
-        remaining_seconds: u64,
-        generation: u64,
-        completed_sessions: u64,
-    ) -> Self {
+    pub const fn from_parts(mode: Mode, configured_seconds: u64, completed_sessions: u64) -> Self {
         Self {
             mode,
             configured_seconds,
-            remaining_seconds,
-            generation,
             completed_sessions,
         }
     }
@@ -105,16 +95,6 @@ impl Timer {
     #[must_use]
     pub const fn configured_seconds(&self) -> u64 {
         self.configured_seconds
-    }
-
-    #[must_use]
-    pub const fn remaining_seconds(&self) -> u64 {
-        self.remaining_seconds
-    }
-
-    #[must_use]
-    pub const fn generation(&self) -> u64 {
-        self.generation
     }
 
     #[must_use]
@@ -138,7 +118,6 @@ impl Timer {
             return false;
         }
         self.configured_seconds = clamped;
-        self.remaining_seconds = clamped;
         true
     }
 
@@ -152,8 +131,6 @@ impl Timer {
             return false;
         }
         self.mode = Mode::Running;
-        self.remaining_seconds = self.configured_seconds;
-        self.generation = self.generation.wrapping_add(1);
         true
     }
 
@@ -184,7 +161,6 @@ impl Timer {
             return false;
         }
         self.mode = Mode::Idle;
-        self.remaining_seconds = self.configured_seconds;
         true
     }
 
@@ -193,35 +169,9 @@ impl Timer {
     /// `Elapsed` too (it is the "start fresh" operation), and unlike
     /// `acknowledge`, it does not require having reached `Elapsed` first.
     pub fn reset(&mut self) -> bool {
-        let changed =
-            !matches!(self.mode, Mode::Idle) || self.remaining_seconds != self.configured_seconds;
+        let changed = !matches!(self.mode, Mode::Idle);
         self.mode = Mode::Idle;
-        self.remaining_seconds = self.configured_seconds;
-        self.generation = self.generation.wrapping_add(1);
         changed
-    }
-
-    /// Consumes `step` seconds of the running session. This is the manual
-    /// stand-in for a host clock (see the module docs and TIMER-F001): on
-    /// a platform with `youth:time`, this would be applied by the host
-    /// when a schedule elapses, not called directly. Running only; a
-    /// no-op elsewhere so that stray advance commands (e.g. a queued
-    /// activation arriving after a pause) cannot corrupt a frozen or idle
-    /// timer.
-    ///
-    /// Reaching zero transitions to `Elapsed` and counts the session as
-    /// completed.
-    pub fn advance(&mut self, step: u64) -> bool {
-        if !matches!(self.mode, Mode::Running) {
-            return false;
-        }
-        let next = self.remaining_seconds.saturating_sub(step);
-        self.remaining_seconds = next;
-        if next == 0 {
-            self.mode = Mode::Elapsed;
-            self.completed_sessions = self.completed_sessions.saturating_add(1);
-        }
-        true
     }
 
     /// Acknowledges an elapsed session and returns to Idle at the
@@ -234,7 +184,6 @@ impl Timer {
             return false;
         }
         self.mode = Mode::Idle;
-        self.remaining_seconds = self.configured_seconds;
         true
     }
 
@@ -242,9 +191,13 @@ impl Timer {
     /// `app.rs` so the displayed string can never diverge from the model
     /// that produced it (the discipline `youth-calculator` calls
     /// CALC-F009).
+    /// Gate C-1 has no tick source, so this reports the configured
+    /// duration. C-2 replaces it with a host-owned countdown node reading
+    /// the live schedule (TIMER-F004); the guest never formats elapsed
+    /// time from its own state again.
     #[must_use]
     pub fn display(&self) -> String {
-        format_seconds(self.remaining_seconds)
+        format_seconds(self.configured_seconds)
     }
 
     /// Applies one command, dispatching to the operation methods above.
@@ -271,12 +224,10 @@ impl Timer {
             Command::Reset => {
                 self.reset();
             }
-            Command::Advance(step) => {
-                self.advance(step);
-            }
             Command::Acknowledge => {
                 self.acknowledge();
             }
+            Command::DismissNotice => {}
         }
     }
 
@@ -285,30 +236,14 @@ impl Timer {
     /// calculator's defensive `Model::is_valid` check at load time.
     #[must_use]
     pub const fn is_valid(&self) -> bool {
-        if self.configured_seconds > MAX_SECONDS {
-            return false;
-        }
-        if self.remaining_seconds > self.configured_seconds {
-            return false;
-        }
-        match self.mode {
-            // Idle always carries a full, unconsumed duration.
-            Mode::Idle => self.remaining_seconds == self.configured_seconds,
-            // Elapsed is reached only by counting all the way down.
-            Mode::Elapsed => self.remaining_seconds == 0,
-            // Running and Paused may hold any remaining duration in
-            // between, including immediately after `start` (== configured)
-            // or immediately before elapsing (== 0 is not reachable here
-            // since `advance` transitions straight to Elapsed at zero).
-            Mode::Running | Mode::Paused => true,
-        }
+        self.configured_seconds <= MAX_SECONDS
     }
 }
 
-/// One user- or test-issued operation on a [`Timer`]. `app.rs` maps SDK
-/// commands onto these; `Command::Advance` is the one variant a platform
-/// with `youth:time` would issue from a host schedule instead of a button
-/// (see the module docs and TIMER-F001).
+/// One user-issued operation on a [`Timer`]. Gate C-1 removed
+/// `Command::Advance`: nothing in this application advances time any more,
+/// and C-2 replaces it with an autonomous host `ScheduleElapsed` delivery
+/// rather than a command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
     AddSeconds(i64),
@@ -317,8 +252,11 @@ pub enum Command {
     Resume,
     Cancel,
     Reset,
-    Advance(u64),
     Acknowledge,
+    /// Clears the migration recovery notice. Purely presentational: it
+    /// changes no timer state, which is exactly why it exercises the
+    /// rule that a no-op command still completes a pending rewrite.
+    DismissNotice,
 }
 
 #[must_use]
@@ -354,6 +292,47 @@ pub fn parse_mode(value: &str) -> Option<Mode> {
     }
 }
 
+/// A Gate A (v1) durable record, already parsed into typed values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LegacyRecord {
+    pub mode: Mode,
+    pub configured_seconds: u64,
+    pub completed_sessions: u64,
+}
+
+/// The result of classifying a legacy record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Migrated {
+    pub model: Timer,
+    /// A live session was reset, so the user must be told.
+    pub recovered: bool,
+}
+
+/// Classifies a Gate A record into the current model.
+///
+/// The policy is deliberately conservative and lives here, in the pure
+/// model, so it is host-testable: `app.rs` only performs the state I/O.
+///
+/// No deadline and no remaining duration is ever invented, because none
+/// ever existed — Gate A's `remaining_seconds` was moved only by manual
+/// `Advance` presses. A legacy `running` or `paused` session therefore
+/// becomes idle at its configured duration and raises a recovery notice,
+/// rather than being reinterpreted as an active schedule. `elapsed` keeps
+/// its meaning, and `completed_sessions` survives every path because it is
+/// real application meaning.
+#[must_use]
+pub const fn migrate_legacy(record: LegacyRecord) -> Migrated {
+    let (mode, recovered) = match record.mode {
+        Mode::Running | Mode::Paused => (Mode::Idle, true),
+        Mode::Idle => (Mode::Idle, false),
+        Mode::Elapsed => (Mode::Elapsed, false),
+    };
+    Migrated {
+        model: Timer::from_parts(mode, record.configured_seconds, record.completed_sessions),
+        recovered,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,69 +342,50 @@ mod tests {
         let timer = Timer::new();
         assert_eq!(timer.mode(), Mode::Idle);
         assert_eq!(timer.configured_seconds(), 0);
-        assert_eq!(timer.remaining_seconds(), 0);
-        assert_eq!(timer.generation(), 0);
         assert_eq!(timer.completed_sessions(), 0);
+        assert!(timer.is_valid());
     }
 
     #[test]
-    fn add_seconds_clamps_to_zero_and_max() {
+    fn add_seconds_clamps_to_the_bounds_and_is_idle_only() {
         let mut timer = Timer::new();
-        assert!(!timer.add_seconds(-5));
-        assert_eq!(timer.configured_seconds(), 0);
+        assert!(
+            !timer.add_seconds(-30),
+            "already zero, so clamping reports no change"
+        );
+        assert_eq!(timer.configured_seconds(), 0, "cannot go below zero");
 
-        assert!(timer.add_seconds(70));
-        assert_eq!(timer.configured_seconds(), 70);
-        assert_eq!(timer.remaining_seconds(), 70);
+        assert!(timer.add_seconds(90));
+        assert_eq!(timer.configured_seconds(), 90);
 
-        assert!(timer.add_seconds(i64::try_from(MAX_SECONDS).unwrap() * 2));
+        assert!(timer.add_seconds(i64::MAX));
         assert_eq!(timer.configured_seconds(), MAX_SECONDS);
-    }
+        assert!(!timer.add_seconds(10), "already at the maximum");
 
-    #[test]
-    fn add_seconds_no_op_reports_no_change() {
-        let mut timer = Timer::new();
-        assert!(!timer.add_seconds(0));
-    }
-
-    #[test]
-    fn add_seconds_is_idle_only() {
-        let mut timer = Timer::new();
-        timer.add_seconds(60);
         timer.start();
-        assert!(!timer.add_seconds(10));
-        assert_eq!(timer.configured_seconds(), 60);
+        assert!(
+            !timer.add_seconds(10),
+            "configuration is fixed once started"
+        );
     }
 
     #[test]
-    fn start_requires_idle_and_nonzero_configured_duration() {
+    fn start_requires_idle_and_a_nonzero_duration() {
         let mut timer = Timer::new();
-        assert!(!timer.start(), "zero duration must not start");
-        assert_eq!(timer.mode(), Mode::Idle);
+        assert!(!timer.start(), "nothing configured");
 
-        timer.add_seconds(30);
+        timer.add_seconds(60);
         assert!(timer.start());
         assert_eq!(timer.mode(), Mode::Running);
-        assert_eq!(timer.remaining_seconds(), 30);
-
         assert!(!timer.start(), "already running");
-    }
-
-    #[test]
-    fn start_advances_generation() {
-        let mut timer = Timer::new();
-        timer.add_seconds(30);
-        let before = timer.generation();
-        timer.start();
-        assert_eq!(timer.generation(), before + 1);
     }
 
     #[test]
     fn pause_and_resume_are_state_gated() {
         let mut timer = Timer::new();
-        assert!(!timer.pause(), "cannot pause while idle");
+        timer.add_seconds(60);
+        assert!(!timer.pause(), "idle cannot pause");
 
-        timer.add_seconds(30);
         timer.start();
         assert!(timer.pause());
         assert_eq!(timer.mode(), Mode::Paused);
@@ -437,86 +397,15 @@ mod tests {
     }
 
     #[test]
-    fn pause_freezes_remaining_duration() {
+    fn cancel_returns_to_idle_from_running_or_paused_only() {
         let mut timer = Timer::new();
-        timer.add_seconds(30);
+        timer.add_seconds(60);
+        assert!(!timer.cancel(), "idle has nothing to cancel");
+
         timer.start();
-        timer.advance(10);
-        timer.pause();
-        let frozen = timer.remaining_seconds();
-        assert!(!timer.advance(5), "advance is a no-op while paused");
-        assert_eq!(timer.remaining_seconds(), frozen);
-    }
-
-    #[test]
-    fn advance_decrements_remaining_while_running() {
-        let mut timer = Timer::new();
-        timer.add_seconds(30);
-        timer.start();
-        assert!(timer.advance(10));
-        assert_eq!(timer.remaining_seconds(), 20);
-    }
-
-    #[test]
-    fn advance_reaching_zero_elapses_and_counts_a_session() {
-        let mut timer = Timer::new();
-        timer.add_seconds(10);
-        timer.start();
-        assert!(timer.advance(10));
-        assert_eq!(timer.mode(), Mode::Elapsed);
-        assert_eq!(timer.remaining_seconds(), 0);
-        assert_eq!(timer.completed_sessions(), 1);
-    }
-
-    #[test]
-    fn advance_saturates_and_does_not_underflow() {
-        let mut timer = Timer::new();
-        timer.add_seconds(5);
-        timer.start();
-        assert!(timer.advance(999));
-        assert_eq!(timer.remaining_seconds(), 0);
-        assert_eq!(timer.mode(), Mode::Elapsed);
-        assert_eq!(timer.completed_sessions(), 1);
-    }
-
-    #[test]
-    fn advance_is_a_no_op_outside_running() {
-        let mut timer = Timer::new();
-        assert!(!timer.advance(1), "idle");
-
-        timer.add_seconds(10);
-        timer.start();
-        timer.advance(10);
-        assert_eq!(timer.mode(), Mode::Elapsed);
-        assert!(!timer.advance(1), "elapsed");
-        assert_eq!(timer.remaining_seconds(), 0);
-    }
-
-    #[test]
-    fn acknowledge_is_elapsed_only_and_restores_configured_duration() {
-        let mut timer = Timer::new();
-        assert!(!timer.acknowledge(), "cannot acknowledge while idle");
-
-        timer.add_seconds(10);
-        timer.start();
-        timer.advance(10);
-        assert!(timer.acknowledge());
-        assert_eq!(timer.mode(), Mode::Idle);
-        assert_eq!(timer.remaining_seconds(), 10);
-        assert!(!timer.acknowledge(), "already acknowledged");
-    }
-
-    #[test]
-    fn cancel_returns_running_or_paused_to_idle() {
-        let mut timer = Timer::new();
-        assert!(!timer.cancel(), "cannot cancel while idle");
-
-        timer.add_seconds(30);
-        timer.start();
-        timer.advance(20);
         assert!(timer.cancel());
         assert_eq!(timer.mode(), Mode::Idle);
-        assert_eq!(timer.remaining_seconds(), 30);
+        assert_eq!(timer.configured_seconds(), 60, "configuration survives");
 
         timer.start();
         timer.pause();
@@ -525,135 +414,154 @@ mod tests {
     }
 
     #[test]
-    fn cancel_does_not_change_completed_sessions() {
+    fn reset_returns_to_idle_from_any_mode() {
         let mut timer = Timer::new();
-        timer.add_seconds(30);
+        timer.add_seconds(60);
         timer.start();
-        timer.cancel();
-        assert_eq!(timer.completed_sessions(), 0);
+        assert!(timer.reset());
+        assert_eq!(timer.mode(), Mode::Idle);
+        assert_eq!(timer.configured_seconds(), 60);
+        assert!(!timer.reset(), "already idle: nothing changed");
     }
 
     #[test]
-    fn reset_returns_to_idle_from_any_mode_and_advances_generation() {
-        for setup in ["idle", "running", "paused", "elapsed"] {
-            let mut timer = Timer::new();
-            timer.add_seconds(10);
-            match setup {
-                "running" => {
-                    timer.start();
-                }
-                "paused" => {
-                    timer.start();
-                    timer.pause();
-                }
-                "elapsed" => {
-                    timer.start();
-                    timer.advance(10);
-                }
-                _ => {}
-            }
-            let before = timer.generation();
-            timer.reset();
-            assert_eq!(timer.mode(), Mode::Idle, "setup: {setup}");
-            assert_eq!(timer.remaining_seconds(), timer.configured_seconds());
-            assert_eq!(timer.generation(), before + 1, "setup: {setup}");
-        }
+    fn acknowledge_is_elapsed_only() {
+        let mut timer = Timer::new();
+        timer.add_seconds(60);
+        assert!(!timer.acknowledge(), "idle has nothing to acknowledge");
+        timer.start();
+        assert!(!timer.acknowledge(), "running has nothing to acknowledge");
     }
 
     #[test]
-    fn display_formats_as_zero_padded_minutes_and_seconds() {
+    fn completed_sessions_are_preserved_across_transitions() {
+        // Sessions are application meaning, distinct from any host
+        // schedule generation (TIMER-F008). Nothing in C-1 increments
+        // them, since nothing elapses; C-2 does so on ScheduleElapsed.
+        let timer = Timer::from_parts(Mode::Elapsed, 300, 7);
+        assert_eq!(timer.completed_sessions(), 7);
+        let mut timer = timer;
+        assert!(timer.reset());
+        assert_eq!(timer.completed_sessions(), 7, "reset preserves sessions");
+    }
+
+    #[test]
+    fn display_formats_the_configured_duration() {
         let mut timer = Timer::new();
         assert_eq!(timer.display(), "00:00");
-
-        timer.add_seconds(9);
-        assert_eq!(timer.display(), "00:09");
-
-        timer.add_seconds(-9);
-        timer.add_seconds(i64::try_from(MAX_SECONDS).unwrap());
+        timer.add_seconds(61);
+        assert_eq!(timer.display(), "01:01");
+        timer.add_seconds(i64::MAX);
         assert_eq!(timer.display(), "99:59");
     }
 
     #[test]
-    fn display_reflects_remaining_not_configured_once_running() {
-        let mut timer = Timer::new();
-        timer.add_seconds(125); // 02:05
-        timer.start();
-        timer.advance(65); // -1:05 -> 01:00
-        assert_eq!(timer.display(), "01:00");
+    fn is_valid_rejects_an_out_of_range_configuration() {
+        assert!(Timer::from_parts(Mode::Idle, MAX_SECONDS, 0).is_valid());
+        assert!(!Timer::from_parts(Mode::Idle, MAX_SECONDS + 1, 0).is_valid());
     }
 
     #[test]
-    fn apply_dispatches_every_command_variant() {
+    fn mode_names_round_trip() {
+        for mode in [Mode::Idle, Mode::Running, Mode::Paused, Mode::Elapsed] {
+            assert_eq!(parse_mode(mode_name(mode)), Some(mode));
+        }
+        assert_eq!(parse_mode("advancing"), None);
+    }
+
+    #[test]
+    fn apply_dispatches_every_command() {
         let mut timer = Timer::new();
-        timer.apply(Command::AddSeconds(20));
-        assert_eq!(timer.configured_seconds(), 20);
+        timer.apply(Command::AddSeconds(120));
+        assert_eq!(timer.configured_seconds(), 120);
         timer.apply(Command::Start);
         assert_eq!(timer.mode(), Mode::Running);
         timer.apply(Command::Pause);
         assert_eq!(timer.mode(), Mode::Paused);
         timer.apply(Command::Resume);
         assert_eq!(timer.mode(), Mode::Running);
-        timer.apply(Command::Advance(20));
-        assert_eq!(timer.mode(), Mode::Elapsed);
-        timer.apply(Command::Acknowledge);
-        assert_eq!(timer.mode(), Mode::Idle);
-        timer.apply(Command::Start);
         timer.apply(Command::Cancel);
         assert_eq!(timer.mode(), Mode::Idle);
-        let before_generation = timer.generation();
         timer.apply(Command::Reset);
-        assert_eq!(timer.generation(), before_generation + 1);
+        assert_eq!(timer.mode(), Mode::Idle);
+        timer.apply(Command::Acknowledge);
+        assert_eq!(timer.mode(), Mode::Idle);
     }
 
-    #[test]
-    fn every_reachable_state_is_valid() {
-        let mut timer = Timer::new();
-        assert!(timer.is_valid(), "fresh");
-        timer.add_seconds(15);
-        assert!(timer.is_valid(), "configured");
-        timer.start();
-        assert!(timer.is_valid(), "just started");
-        timer.advance(5);
-        assert!(timer.is_valid(), "running, partially consumed");
-        timer.pause();
-        assert!(timer.is_valid(), "paused");
-        timer.resume();
-        timer.advance(10);
-        assert!(timer.is_valid(), "elapsed");
-        assert_eq!(timer.mode(), Mode::Elapsed);
-        timer.acknowledge();
-        assert!(timer.is_valid(), "acknowledged");
-    }
-
-    #[test]
-    fn is_valid_rejects_out_of_range_and_inconsistent_records() {
-        let mut over_max = Timer::new();
-        over_max.configured_seconds = MAX_SECONDS + 1;
-        assert!(!over_max.is_valid());
-
-        let mut remaining_exceeds_configured = Timer::new();
-        remaining_exceeds_configured.configured_seconds = 10;
-        remaining_exceeds_configured.remaining_seconds = 11;
-        assert!(!remaining_exceeds_configured.is_valid());
-
-        let mut idle_with_stale_remaining = Timer::new();
-        idle_with_stale_remaining.configured_seconds = 30;
-        idle_with_stale_remaining.remaining_seconds = 10;
-        idle_with_stale_remaining.mode = Mode::Idle;
-        assert!(!idle_with_stale_remaining.is_valid());
-
-        let mut elapsed_with_nonzero_remaining = Timer::new();
-        elapsed_with_nonzero_remaining.configured_seconds = 30;
-        elapsed_with_nonzero_remaining.remaining_seconds = 5;
-        elapsed_with_nonzero_remaining.mode = Mode::Elapsed;
-        assert!(!elapsed_with_nonzero_remaining.is_valid());
-    }
-
-    #[test]
-    fn mode_name_round_trips_through_parse_mode() {
-        for mode in [Mode::Idle, Mode::Running, Mode::Paused, Mode::Elapsed] {
-            assert_eq!(parse_mode(mode_name(mode)), Some(mode));
+    fn legacy(mode: Mode, configured: u64, sessions: u64) -> LegacyRecord {
+        LegacyRecord {
+            mode,
+            configured_seconds: configured,
+            completed_sessions: sessions,
         }
-        assert_eq!(parse_mode("not-a-mode"), None);
+    }
+
+    #[test]
+    fn legacy_idle_migrates_unchanged_without_a_notice() {
+        let out = migrate_legacy(legacy(Mode::Idle, 300, 4));
+        assert_eq!(out.model.mode(), Mode::Idle);
+        assert_eq!(out.model.configured_seconds(), 300);
+        assert_eq!(out.model.completed_sessions(), 4);
+        assert!(!out.recovered);
+    }
+
+    #[test]
+    fn legacy_running_never_fabricates_a_schedule() {
+        // Gate A's running timer was never running against real time, so
+        // migration must not present it as an active session.
+        let out = migrate_legacy(legacy(Mode::Running, 300, 2));
+        assert_eq!(out.model.mode(), Mode::Idle, "no deadline is invented");
+        assert_eq!(out.model.configured_seconds(), 300);
+        assert_eq!(out.model.completed_sessions(), 2);
+        assert!(out.recovered, "the user must be told it was reset");
+    }
+
+    #[test]
+    fn legacy_paused_is_reset_for_the_same_reason() {
+        let out = migrate_legacy(legacy(Mode::Paused, 90, 1));
+        assert_eq!(out.model.mode(), Mode::Idle);
+        assert_eq!(out.model.configured_seconds(), 90);
+        assert!(out.recovered);
+    }
+
+    #[test]
+    fn legacy_elapsed_preserves_its_meaning_and_sessions() {
+        let out = migrate_legacy(legacy(Mode::Elapsed, 120, 9));
+        assert_eq!(out.model.mode(), Mode::Elapsed);
+        assert_eq!(
+            out.model.completed_sessions(),
+            9,
+            "sessions are real meaning"
+        );
+        assert!(!out.recovered, "elapsed was not a live session");
+    }
+
+    #[test]
+    fn completed_sessions_survive_every_migration_path() {
+        for mode in [Mode::Idle, Mode::Running, Mode::Paused, Mode::Elapsed] {
+            assert_eq!(
+                migrate_legacy(legacy(mode, 60, 11))
+                    .model
+                    .completed_sessions(),
+                11,
+                "{mode:?} lost its session count"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_is_idempotent_on_its_own_output() {
+        // Re-classifying an already-migrated record must be a fixed point:
+        // idle stays idle and elapsed stays elapsed, with no second notice.
+        for mode in [Mode::Idle, Mode::Running, Mode::Paused, Mode::Elapsed] {
+            let once = migrate_legacy(legacy(mode, 300, 3));
+            let twice = migrate_legacy(legacy(
+                once.model.mode(),
+                once.model.configured_seconds(),
+                once.model.completed_sessions(),
+            ));
+            assert_eq!(twice.model, once.model, "{mode:?} is not a fixed point");
+            assert!(!twice.recovered, "{mode:?} re-raised a recovery notice");
+        }
     }
 }
