@@ -1,4 +1,4 @@
-package youth:app@0.0.4;
+package youth:app@0.0.5;
 
 interface ui {
     type node-id = u64;
@@ -21,6 +21,30 @@ interface ui {
         end,
     }
 
+    record schedule-ref {
+        id: u64,
+        generation: u64,
+    }
+
+    enum time-precision {
+        seconds,
+    }
+
+    enum countdown-format {
+        minutes-seconds,
+    }
+
+    record countdown-data {
+        schedule: schedule-ref,
+        precision: time-precision,
+        format: countdown-format,
+    }
+
+    variant text-content {
+        literal(string),
+        countdown(countdown-data),
+    }
+
     variant shortcut-key {
         character(string),
         enter,
@@ -34,7 +58,7 @@ interface ui {
     }
 
     record text-data {
-        value: string,
+        content: text-content,
         alignment: text-alignment,
     }
 
@@ -73,7 +97,7 @@ interface ui {
 
     record set-text {
         id: node-id,
-        value: string,
+        value: text-content,
     }
 
     record set-label {

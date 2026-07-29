@@ -42,6 +42,11 @@ key enter
 expect text mode "Mode: running"
 expect text sessions "Sessions: 2"
 
+# The countdown is a real host-owned schedule reference now, not the
+# literal "05:00" it showed while idle -- migration and real schedule
+# adoption happen in the same turn, all the way through presentation.
+expect countdown countdown
+
 # The rewrite happened.
 expect state integer "model-schema-version" 2
 expect state missing "remaining-seconds"

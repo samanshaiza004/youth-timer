@@ -6,12 +6,16 @@ automatically authorize platform features.
 
 Gate A implemented the Timer domain model and command surface with the
 capabilities Youth had at the time, and recorded what could not be built.
-Gate C-1 versioned and migrated that durable state. Gate C-2 wires
+Gate C-1 versioned and migrated that durable state. Gate C-2 wired
 `Start`/`Pause`/`Resume`/`Cancel`/`Reset` to real host schedules through
-`context.time()` and reacts to autonomous `ScheduleElapsed` delivery in
-principle, though that delivery path is unproven from this repo's own
-test suite (see the Gate status section below). See `README.md` for the
-current state and what remains open.
+`context.time()`. Gate C-3 adopts host-owned countdown presentation: the
+`countdown` node is a real `Countdown` bound to the active schedule while
+Running or Paused, retargeted to whatever new schedule identity pausing
+or resuming returns, and a literal string only while Idle or Elapsed.
+Autonomous `ScheduleElapsed` delivery is still unproven from this repo's
+own test suite (see the Gate status section below) — that, and real
+overdue recovery, are Gate C-4 scope. See `README.md` for the current
+state and what remains open.
 
 ## The main result
 
@@ -33,61 +37,78 @@ Not needed:
   - a different persistence API
 ```
 
-## Gate status: Gate C-1 and the synchronous half of C-2 are complete
+## Gate status: Gate C-3 countdown presentation is adopted
 
-- **TIMER-F003 and TIMER-F008 are closed as application evidence, not
-  just platform capability.** `remaining_seconds` and the guest-invented
-  `generation` are gone from `src/model.rs` entirely; `ScheduleHandle`'s
-  generation is the real value `Schedule::generation()` returns, and
-  `LEGACY_KEYS` are deleted, never reused, on migration.
-- **TIMER-F011 is closed** (unchanged from Gate B: a durable schedule's
-  ownership never required a live guest instance).
-- **TIMER-F001, F002, and F007 are partially closed.** `Start`, `Pause`,
-  `Resume`, `Cancel`, and `Reset` all now perform a real host schedule
-  operation before the model transitions (`src/app.rs`'s `apply_command`),
-  and `restart` proves the resulting schedule identity survives a process
-  exit and revalidates on remount — real evidence for declaration and for
-  the storage half of F007. What remains unproven **from this repo's own
-  test suite**: `.youth-test` has no way to wait on real elapsed time or
-  fire a virtual-clock wake, so the autonomous `ScheduleElapsed` path
-  (`handle_elapsed`) has never actually been exercised end to end here,
-  only reviewed. Overdue reconciliation across a real process-closed
-  interval is similarly unproven from this side. TIMER-F013 already named
-  the boundary; delivery testing is the concrete case it predicted.
-- **TIMER-F004 and F006 are untouched.** `display()` still reports the
-  configured duration, not a live countdown — host-owned temporal
-  presentation is Gate C-3. Notification is Gate D.
+- **TIMER-F003, F004, F008, and F011 are closed as application
+  evidence, not just platform capability.** `remaining_seconds` and the
+  guest-invented `generation` are gone from `src/model.rs` entirely;
+  `ScheduleHandle`'s generation is the real value `Schedule::generation()`
+  returns; a durable schedule's ownership never required a live guest
+  instance (Gate B). New this gate: the `countdown` node is a real
+  host-owned `Countdown` bound to the active schedule while Running or
+  Paused, and a literal string only while Idle or Elapsed
+  (`src/app.rs`'s `countdown_content`) — the countdown visibly updates
+  without a guest turn, proven generically at the platform level
+  (`crates/youth-runtime/tests/countdown_presentation.rs` in the Youth
+  workspace) and, in this repo, by `expect countdown` proving the node
+  is genuinely bound to a live schedule reference after `Start`,
+  `Pause`, `Resume`, and a `restart` in either mode — not a value this
+  application recomputed or formatted itself.
+- **TIMER-F001 is closed.** Declarative scheduling (Gate C-2) plus
+  host-owned presentation (this gate) together are exactly what the
+  finding asked for; wording corrected per its 2026-07-25 note to
+  describe the closed capability, not guest clock access.
+- **TIMER-F002 remains partially closed, not fully closed.** `handle_elapsed`
+  now also retargets the display to the literal `"00:00"` on a genuine
+  `ScheduleElapsed` (see `Model::display`), but this repo's own test
+  suite still cannot trigger one: `.youth-test` has no virtual clock and
+  no way to wake a due schedule, so the autonomous path has been
+  reviewed and exercised at the platform level, never end to end from
+  here. This is exactly the gap Gate C-4 is scoped to close (failed
+  elapsed delivery and redelivery are explicitly on its list).
+- **TIMER-F007 stays partially closed**, unchanged from Gate C-2:
+  schedule identity persists and revalidates across restart; overdue
+  reconciliation across a real closed-process interval is still
+  unproven from this repo and is explicitly Gate C-4 scope.
+- **TIMER-F006 is untouched** — notification is Gate D, not this gate.
+- **New: TIMER-F014**, a positive finding — the same semantic node
+  safely retargets between literal and host-derived temporal content
+  across a mode change, with the application never touching schedule
+  rendering mechanics (no display-string formatting for Running/Paused,
+  no resolved-value reading, no clock access anywhere in this crate).
 
 ## Open findings
 
 | ID | Summary | Next decision |
 | --- | --- | --- |
-| TIMER-F001 | *(partially closed, C-2)* Declaration and persistence now use real host schedules; delivery and presentation remain unproven from this repo | Prove `ScheduleElapsed` end to end once a virtual-clock test path exists; build host-owned presentation (Gate C-3) |
-| TIMER-F002 | *(code path exists, C-2)* `handle_elapsed` reacts to `ScheduleElapsed`, but no test in this repo has ever driven a real delivery through it | Needs the same virtual-clock test path as F001 |
+| TIMER-F001 | *(closed, C-2/C-3)* Declarative scheduling plus host-owned countdown presentation are both wired and observed | None; closed |
+| TIMER-F002 | *(partially closed, C-2/C-3)* `handle_elapsed` reacts to `ScheduleElapsed` and retargets display to `"00:00"`, but no test in this repo has ever driven a real delivery through it | Gate C-4: prove elapsed delivery and redelivery end to end |
 | TIMER-F003 | *(closed, C-1/C-2)* `remaining_seconds` deleted; the host owns it entirely | None; closed |
-| TIMER-F004 | Countdown presentation cannot update without invoking the guest | Requires host-owned temporal presentation (the design's countdown node) |
+| TIMER-F004 | *(closed, C-3)* The `countdown` node is a real `Countdown` while Running/Paused; it visibly updates without a guest turn | None; closed |
 | TIMER-F005 | Incremental `handle` updates can silently diverge from a fresh `view` | Materially strengthens CALC-F009; justifies building a `--verify-view-convergence` test mode (design recorded below), not yet SDK diffing/reactive dependencies |
 | TIMER-F006 | No native notification effect on elapse | Decision recorded: attach a bounded notification descriptor to the schedule, not a general effects API |
-| TIMER-F007 | *(partially closed, C-2)* `restart` now proves the schedule identity itself persists and revalidates, not just app state | Overdue reconciliation across a real closed-process interval is still unproven from this repo |
+| TIMER-F007 | *(partially closed, C-2)* `restart` now proves the schedule identity itself persists and revalidates, not just app state | Gate C-4: overdue reconciliation across a real closed-process interval |
 | TIMER-F008 | *(closed, C-2)* `ScheduleHandle`'s generation is the real host-issued value; `completed_sessions` stays a separate application counter | None; closed |
+| TIMER-F014 | *(positive finding, C-3)* The same semantic node safely retargets between literal and host-derived content across a mode change | None; closed |
 
 ## Findings index
 
 | ID | Summary | Status | Primary implication |
 | --- | --- | --- | --- |
-| TIMER-F001 | Declaration/persistence via real schedules | Partially addressed (C-2) | Delivery and presentation remain unproven from this repo's own tests |
-| TIMER-F002 | `handle_elapsed` exists but is untested end to end | Partially addressed (C-2) | Needs a virtual-clock test path this repo does not have |
+| TIMER-F001 | Declarative scheduling and host-owned presentation, both wired | Addressed (C-2/C-3) | Timer's `view`/`handle` never format a live countdown or a deadline themselves |
+| TIMER-F002 | `handle_elapsed` exists and retargets display, but is untested end to end | Partially addressed (C-2/C-3) | Needs a virtual-clock test path this repo does not have; Gate C-4 scope |
 | TIMER-F003 | Guest no longer persists remaining duration | Addressed (C-1/C-2) | `remaining_seconds` deleted entirely |
-| TIMER-F004 | Countdown cannot self-update | Open | Every visible tick costs a full guest turn |
+| TIMER-F004 | Countdown self-updates without a guest turn | Addressed (C-3) | `countdown_content` binds a real `Countdown` node while Running/Paused |
 | TIMER-F005 | Incremental `handle` updates can silently diverge from a fresh `view` | Addressed in this app; platform risk remains open (tracked by youth's CALC-F009) | Turns theoretical CALC-F009 risk into a reproduced bug; justifies a convergence-checker test mode |
 | TIMER-F006 | No native notification effect | Open (design decision recorded) | Elapse cannot alert the user outside the window; recommend schedule-attached notification descriptor |
-| TIMER-F007 | Schedule identity persists and revalidates across restart | Partially addressed (C-2) | Overdue reconciliation across a real closed interval remains unproven here |
+| TIMER-F007 | Schedule identity persists and revalidates across restart | Partially addressed (C-2) | Overdue reconciliation across a real closed interval remains unproven here; Gate C-4 scope |
 | TIMER-F008 | Schedule generation is host-issued in the running application | Addressed (C-2) | `ScheduleHandle` mirrors the real `Schedule.generation()` value |
 | TIMER-F009 | Mode machine, bounded configuration, sessions, commands, and shortcuts are fully expressible today | Addressed (positive boundary confirmation) | The non-temporal design surface needs no new protocol — see "The main result" above |
 | TIMER-F010 | The host does not enforce a button's `enabled` flag on activation; it is presentation only | Addressed (boundary confirmation) | The guest must self-guard every command; test DSL naming (`activate` vs. a future `click`) recorded |
-| TIMER-F013 | The `.youth-test` DSL can now seed durable state (Youth `97d7b3b`'s successor commit) but still cannot wait on real time or fire a virtual-clock wake | Partially addressed | Migration is now integration-tested (see `tests/migration_then_start.youth-test`); elapsed-delivery testing remains the open corollary |
+| TIMER-F013 | The `.youth-test` DSL can seed durable state and (as of this gate) assert a node's temporal content kind, but still cannot wait on real time, resolve a live display value, fire a virtual-clock wake, or inject a mid-turn failure | Partially addressed | Migration and content-kind retargeting are integration-tested; elapsed-delivery and rollback-injection testing remain the open corollary |
 | TIMER-F012 | An application cannot migrate its own durable state at load time; `view` is read-only | Open | Migration must defer to the first event turn, so legacy interpretation can never be retired on the app's own schedule |
 | TIMER-F011 | Schedule ownership across app unloading is undefined | Addressed (Gate B) | The host owns schedule existence, due detection, and pending delivery; the guest owns only its transactional reaction |
+| TIMER-F014 | A semantic node safely retargets between literal and host-derived temporal content | Addressed (positive boundary confirmation) | The application declares which schedule and format apply; it never renders, diffs, or formats the resolved value itself |
 
 ## Suggested Gate B priority
 
@@ -985,3 +1006,57 @@ application repository. This is the same category of boundary as the
 `ScheduleElapsed`-delivery gap noted in the Gate status section: real,
 named, and deliberately left open rather than claimed closed on
 review alone.
+
+## TIMER-F014 — A semantic node safely retargets between literal and host-derived temporal content
+
+- **Status:** Addressed (positive boundary confirmation)
+- **Observed:** 2026-07-29
+- **Application:** Youth Timer
+- **Workflow stage:** Gate C-3 adoption (`src/app.rs`, `src/model.rs`)
+- **Platform:** macOS, headless real runtime and `wasm32-wasip2` build,
+  protocol `0.0.5`
+- **Local path:** `/Users/keina/dev/youth-timer`
+- **Commit:** Gate C-3 adoption
+- **Evidence:** The `countdown` node changes content kind across every mode
+  transition — literal `MM:SS` while Idle, a live `Countdown` bound to the
+  active schedule while Running or Paused, literal `"00:00"` once Elapsed —
+  and the same symbolic node name (`node!("countdown")`) is reused
+  throughout; nothing in `src/app.rs` ever declares a second node or
+  branches presentation logic outside `countdown_content`/
+  `countdown_element`/`countdown_update`, the one place that decides which
+  kind applies. Pausing and resuming both hand back a new schedule
+  generation from the host, and the same retargeting call
+  (`countdown_update`) is what re-binds the display to it — there is no
+  separate "update the reference" step an author could forget.
+- **Developer impact:** Positive. An author does not need two node names,
+  a manual show/hide toggle, or any conditional rendering scheme to move
+  between "static text" and "live host value" — the SDK's `Text`/
+  `Countdown` builders and `Update::set_text`/`set_countdown` are
+  interchangeable targets for the same key, and the host accepts either
+  at any point in a node's life (`crates/youth-tree`'s cross-kind
+  retargeting, added alongside the WIT change this app now depends on).
+- **What could not be expressed:** N/A — this is a capability that worked
+  as designed, not a gap.
+- **What felt repetitive:** N/A.
+- **What leaked WIT details:** None. `countdown_content` reads only this
+  app's own `Model::mode()` and the `Schedule` value threaded through
+  `apply_command`/`load`; it never touches `text-content`,
+  `schedule-ref`, or any other wire type by name.
+- **What required host policy:** Deciding that content-kind retargeting is
+  valid on any text-family node regardless of its current kind, and that
+  alignment is preserved across the swap — both host-side decisions
+  (`crates/youth-tree`'s `Patch::SetText`/`SetCountdown` handling), not
+  something this application had to work around or duplicate.
+- **Unavoidable protocol addition:** None; this finding is evidence the
+  Gate C-3 design (D7 in `DEVELOPER-PREVIEW-2.md`) is sufficient as built,
+  not a request for more.
+- **What remains SDK/application behavior:** Deciding *which* mode gets
+  which content kind (`countdown_content`'s match on `Model::mode()`) is
+  ordinary domain logic and stays application-owned; the SDK only
+  supplies the two node kinds and the guarantee that either can target
+  the same key.
+- **Impact:** None negative. Recorded so the retargeting pattern this app
+  used is legible to the next Utility Suite app that needs the same
+  literal-or-live presentation shape, rather than rediscovered from
+  scratch.
+- **Resolution:** N/A; this finding documents a capability, not a defect.

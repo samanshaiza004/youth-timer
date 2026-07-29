@@ -34,38 +34,56 @@ expect text mode "Mode: idle"
 key enter
 expect text mode "Mode: running"
 
+# The countdown node retargeted from literal text to a real host-owned
+# schedule reference (TIMER-F004) -- not a value this app resolved or
+# formatted itself; `expect countdown` cannot read what it will display,
+# only that the host is now the one who will.
+expect countdown countdown
+
 # Configuration is fixed once running.
 activate add-1m
 expect text mode "Mode: running"
 
 # Pause via its shortcut, proving the host returned a usable paused
 # schedule (a stale-generation error from a broken pause implementation
-# would surface as a rejected command here, not a silent no-op).
+# would surface as a rejected command here, not a silent no-op). The
+# countdown stays bound to a live schedule -- the *new*, paused-generation
+# identity the host just returned, per apply_command's contract.
 key "p"
 expect text mode "Mode: paused"
+expect countdown countdown
 
-# Resume via its shortcut.
+# Resume via its shortcut, retargeting again to the resumed generation.
 key "u"
 expect text mode "Mode: running"
+expect countdown countdown
 
 # Durable state survives a restart: mode is the canonical model, not a
 # derived display string, and the active schedule identity persists with
 # it (the runtime revalidates it as part of loading, not just formats it).
+# The countdown is reconstructed as a live schedule reference, not
+# reformatted as a literal value.
 restart
 expect text mode "Mode: running"
 expect text sessions "Sessions: 0"
+expect countdown countdown
 
-# Cancel via its shortcut retires the host schedule and returns to idle.
+# Cancel via its shortcut retires the host schedule and returns to idle --
+# and the display retargets back to a literal, configured-duration string.
 key escape
 expect text mode "Mode: idle"
+expect text countdown "01:00"
 
 # Start again, then Reset via its shortcut -- valid even though nothing
-# elapsed, and also retires the newly created schedule.
+# elapsed, and also retires the newly created schedule, retargeting the
+# countdown back to literal text.
 key enter
 expect text mode "Mode: running"
+expect countdown countdown
 key backspace
 expect text mode "Mode: idle"
 expect text sessions "Sessions: 0"
+expect text countdown "01:00"
 
 # A freshly created record needed no migration, so no recovery notice.
 expect text notice ""

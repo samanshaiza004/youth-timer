@@ -286,17 +286,24 @@ impl Timer {
         true
     }
 
-    /// The `MM:SS` countdown text. Shared by `view` and `handle` in
-    /// `app.rs` so the displayed string can never diverge from the model
-    /// that produced it (the discipline `youth-calculator` calls
-    /// CALC-F009).
-    /// Gate C-1 has no tick source, so this reports the configured
-    /// duration. C-2 replaces it with a host-owned countdown node reading
-    /// the live schedule (TIMER-F004); the guest never formats elapsed
-    /// time from its own state again.
+    /// The `MM:SS` literal text for a mode that has no live host schedule
+    /// to display instead. Shared by `view` and `handle` in `app.rs` so the
+    /// displayed string can never diverge from the model that produced it
+    /// (the discipline `youth-calculator` calls CALC-F009).
+    ///
+    /// Only meaningful for `Idle` (the configured duration, not yet
+    /// running) and `Elapsed` (the session is over: `00:00`, not whatever
+    /// duration was configured — TIMER-F004). `Running` and `Paused` are
+    /// never presented from this method: `app.rs` presents those as a
+    /// host-owned `Countdown` bound to the real schedule instead, since a
+    /// live countdown is exactly what this pure, clock-free model cannot
+    /// compute.
     #[must_use]
     pub fn display(&self) -> String {
-        format_seconds(self.configured_seconds)
+        match self.mode {
+            Mode::Idle | Mode::Running | Mode::Paused => format_seconds(self.configured_seconds),
+            Mode::Elapsed => format_seconds(0),
+        }
     }
 
     /// Checks the invariants a loaded (and therefore potentially
@@ -624,6 +631,14 @@ mod tests {
         assert_eq!(timer.display(), "01:01");
         timer.add_seconds(i64::MAX);
         assert_eq!(timer.display(), "99:59");
+    }
+
+    #[test]
+    fn display_is_zero_once_elapsed_regardless_of_configured_duration() {
+        // The session is over; showing the configured duration again would
+        // read as "still 5 minutes to go" rather than "done" (TIMER-F004).
+        let timer = Timer::from_parts(Mode::Elapsed, 300, 1, None);
+        assert_eq!(timer.display(), "00:00");
     }
 
     #[test]

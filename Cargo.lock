@@ -325,7 +325,7 @@ dependencies = [
 [[package]]
 name = "youth-sdk"
 version = "0.0.2"
-source = "git+https://github.com/samanshaiza004/youth?rev=4a0bba175e7eb9643a0348a94a6a3efadbdae0e1#4a0bba175e7eb9643a0348a94a6a3efadbdae0e1"
+source = "git+https://github.com/samanshaiza004/youth?rev=bfd539ca5e0d8d63b9dcdb28c744758255560dc1#bfd539ca5e0d8d63b9dcdb28c744758255560dc1"
 dependencies = [
  "wit-bindgen",
 ]

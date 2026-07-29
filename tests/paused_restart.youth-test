@@ -1,0 +1,31 @@
+# Gate C-3's restart-while-paused case, distinct from basic.youth-test's
+# restart-while-running: pausing bumps the schedule's generation before
+# the process exits, so this proves the *paused* generation -- not the
+# one Start originally returned -- is what survives and revalidates.
+
+mount
+activate add-1m
+key enter
+expect text mode "Mode: running"
+expect countdown countdown
+
+key "p"
+expect text mode "Mode: paused"
+expect countdown countdown
+
+restart
+expect text mode "Mode: paused"
+expect text sessions "Sessions: 0"
+
+# The countdown reconstructs as a live schedule reference bound to the
+# paused generation the host issued before the restart -- not a literal
+# frozen value this app computed, and not the pre-pause generation Start
+# originally returned.
+expect countdown countdown
+
+# Resuming after the restart proves the reconstructed reference is a
+# real, currently-valid handle: a stale one would surface as a rejected
+# command here, not a silent no-op.
+key "u"
+expect text mode "Mode: running"
+expect countdown countdown

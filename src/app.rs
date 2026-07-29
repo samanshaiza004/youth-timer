@@ -36,7 +36,11 @@ pub(crate) struct Timer;
 impl Application for Timer {
     fn view(context: &ViewContext) -> Result<Tree> {
         let loaded = load(context.state())?;
-        Ok(present(&loaded.model, loaded.recovered))
+        Ok(present(
+            &loaded.model,
+            loaded.recovered,
+            loaded.wire_schedule,
+        ))
     }
 
     fn handle(context: &mut EventContext, events: &Events) -> Result<Update> {
@@ -60,7 +64,7 @@ impl Application for Timer {
         let before = model;
         let dismissing = matches!(command, Command::DismissNotice);
 
-        apply_command(context, &mut model, command, loaded.wire_schedule)?;
+        let schedule = apply_command(context, &mut model, command, loaded.wire_schedule)?;
 
         let changed = model != before;
         let recovered = loaded.recovered && !dismissing;
@@ -77,7 +81,7 @@ impl Application for Timer {
         if !changed && loaded.recovered == recovered {
             return Ok(Update::unchanged());
         }
-        Ok(present_update(&model, recovered))
+        Ok(present_update(&model, recovered, schedule))
     }
 }
 
@@ -86,12 +90,22 @@ impl Application for Timer {
 /// above. Guard checks are read from the model's own `can_*` queries
 /// rather than duplicated ad hoc, so app.rs and the model can never
 /// disagree about when a command is valid.
+///
+/// Returns the schedule this command leaves active, if any — the *exact*
+/// value the host just returned from `schedule_after`/`pause`/`resume`,
+/// never a value reconstructed from the model's plain `(id, generation)`
+/// mirror (the SDK's `Schedule` has no public constructor for exactly this
+/// reason). `present_update` uses this to retarget the countdown display
+/// node in the same turn: pausing and resuming both bump the schedule's
+/// generation, so the pre-call reference is already stale and must not be
+/// what the display keeps pointing at.
 fn apply_command(
     context: &mut EventContext,
     model: &mut Model,
     command: Command,
     current_schedule: Option<Schedule>,
-) -> Result<()> {
+) -> Result<Option<Schedule>> {
+    let mut schedule = current_schedule;
     match command {
         Command::AddSeconds(delta) => {
             model.add_seconds(delta);
@@ -99,13 +113,14 @@ fn apply_command(
         Command::Start => {
             if model.can_start() {
                 let duration = Duration::from_secs(model.configured_seconds());
-                let schedule = context.time().schedule_after(
+                let armed = context.time().schedule_after(
                     duration,
                     ScheduleOptions::new()
                         .notification(Notification::new("Youth Timer", "Your timer has elapsed.")),
                 )?;
-                model.start(to_handle(schedule));
-                context.state().set_schedule(SCHEDULE_KEY, schedule)?;
+                model.start(to_handle(armed));
+                context.state().set_schedule(SCHEDULE_KEY, armed)?;
+                schedule = Some(armed);
             }
         }
         Command::Pause => {
@@ -115,6 +130,7 @@ fn apply_command(
                 let updated = context.time().pause(current)?;
                 model.pause(to_handle(updated));
                 context.state().set_schedule(SCHEDULE_KEY, updated)?;
+                schedule = Some(updated);
             }
         }
         Command::Resume => {
@@ -124,6 +140,7 @@ fn apply_command(
                 let updated = context.time().resume(current)?;
                 model.resume(to_handle(updated));
                 context.state().set_schedule(SCHEDULE_KEY, updated)?;
+                schedule = Some(updated);
             }
         }
         Command::Cancel => {
@@ -133,6 +150,7 @@ fn apply_command(
                 }
                 model.cancel();
                 context.state().delete(SCHEDULE_KEY)?;
+                schedule = None;
             }
         }
         Command::Reset => {
@@ -141,6 +159,7 @@ fn apply_command(
             }
             if model.reset() {
                 context.state().delete(SCHEDULE_KEY)?;
+                schedule = None;
             }
         }
         Command::Acknowledge => {
@@ -148,7 +167,7 @@ fn apply_command(
         }
         Command::DismissNotice => {}
     }
-    Ok(())
+    Ok(schedule)
 }
 
 /// Reacts to an autonomous `ScheduleElapsed` delivery. This is not a
@@ -173,7 +192,7 @@ fn handle_elapsed(context: &mut EventContext, delivered: ScheduleHandle) -> Resu
     save(context.state(), &model, loaded.recovered)?;
     delete_legacy(context.state())?;
     context.state().delete(SCHEDULE_KEY)?;
-    Ok(present_update(&model, loaded.recovered))
+    Ok(present_update(&model, loaded.recovered, None))
 }
 
 fn to_handle(schedule: Schedule) -> ScheduleHandle {
@@ -183,16 +202,65 @@ fn to_handle(schedule: Schedule) -> ScheduleHandle {
     }
 }
 
+/// What the `countdown` node should show: a literal string this
+/// application formatted itself, or a live reference to a host-owned
+/// schedule the host resolves and repaints on its own (TIMER-F004).
+enum CountdownContent {
+    Literal(String),
+    Live(Schedule),
+}
+
+/// Decides [`CountdownContent`] from the model's mode alone — `Idle` and
+/// `Elapsed` have no schedule to show, so they always present
+/// [`Model::display`]'s literal text (the configured duration, or `00:00`
+/// once elapsed); `Running` and `Paused` always present the live schedule.
+///
+/// `schedule` must be the schedule this exact turn leaves active (see
+/// [`apply_command`]'s doc comment) — never a value read independently of
+/// it, since pausing and resuming both return a new generation. Only
+/// `Running`/`Paused` ever read it; `Model::is_valid` guarantees it is
+/// `Some` whenever the mode requires it, but a defensive `None` still
+/// falls back to a literal rather than presenting nothing.
+fn countdown_content(model: &Model, schedule: Option<Schedule>) -> CountdownContent {
+    match model.mode() {
+        Mode::Idle | Mode::Elapsed => CountdownContent::Literal(model.display()),
+        Mode::Running | Mode::Paused => match schedule {
+            Some(schedule) => CountdownContent::Live(schedule),
+            None => CountdownContent::Literal(model.display()),
+        },
+    }
+}
+
+fn countdown_element(model: &Model, schedule: Option<Schedule>) -> Element {
+    match countdown_content(model, schedule) {
+        CountdownContent::Literal(value) => Text::new(node!("countdown"), value),
+        CountdownContent::Live(schedule) => Countdown::new(node!("countdown"), schedule),
+    }
+    .align(TextAlign::Center)
+}
+
+fn countdown_update(update: Update, model: &Model, schedule: Option<Schedule>) -> Update {
+    match countdown_content(model, schedule) {
+        CountdownContent::Literal(value) => update.set_text(node!("countdown"), value),
+        CountdownContent::Live(schedule) => update.set_countdown(
+            node!("countdown"),
+            schedule,
+            TimePrecision::Seconds,
+            CountdownFormat::MinutesSeconds,
+        ),
+    }
+}
+
 /// Builds the full semantic tree from a model. Shared by `view` (as the
 /// initial/resync tree) and, via [`present_update`], by every
 /// state-changing branch of `handle` — one presentation function is the
 /// only way `view` and `handle` can never disagree about what a mode
 /// implies, matching this app's own `ButtonEnabled::compute` discipline
 /// (TIMER-F005) and the calculator's CALC-F009.
-fn present(model: &Model, recovered: bool) -> Tree {
+fn present(model: &Model, recovered: bool, schedule: Option<Schedule>) -> Tree {
     let enabled = ButtonEnabled::compute(model);
     Tree::root(Column::new([
-        Text::new(node!("countdown"), model.display()).align(TextAlign::Center),
+        countdown_element(model, schedule),
         Text::new(node!("notice"), notice_line(recovered)),
         Text::new(node!("mode"), mode_line(model)),
         Text::new(node!("sessions"), sessions_line(model)),
@@ -238,10 +306,9 @@ fn present(model: &Model, recovered: bool) -> Tree {
 /// node `present` can set must be reissued here on every state-changing
 /// turn — including every button's `enabled` state — or a node keeps
 /// whatever value the previous turn last set (TIMER-F005).
-fn present_update(model: &Model, recovered: bool) -> Update {
+fn present_update(model: &Model, recovered: bool, schedule: Option<Schedule>) -> Update {
     let enabled = ButtonEnabled::compute(model);
-    Update::new()
-        .set_text(node!("countdown"), model.display())
+    countdown_update(Update::new(), model, schedule)
         .set_text(node!("mode"), mode_line(model))
         .set_text(node!("sessions"), sessions_line(model))
         .set_text(node!("notice"), notice_line(recovered))
