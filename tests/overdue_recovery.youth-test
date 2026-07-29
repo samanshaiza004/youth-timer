@@ -1,0 +1,26 @@
+# Gate C-4's decisive real-time case: a schedule whose deadline passes
+# while the process is closed is recovered -- delivered, not merely
+# reconciled -- once the app reopens. `sleep` is a genuine wall-clock
+# sleep in the *test harness*, not the guest; pairing it with the
+# smallest duration this app's own command surface can create (10s,
+# via a single add-10s) keeps this test's real runtime bounded rather
+# than requiring a virtual clock this repo does not have.
+#
+# `restart` tears the process down and reopens it exactly like a real
+# closed-then-reopened app would: the durable schedule's real deadline
+# has already passed by the time this runs, so reconciliation queues
+# an elapsed delivery, and mounting delivers it -- the same host
+# behavior Gate C-4 restored (see ../FINDINGS.md, TIMER-F002/F007).
+
+mount
+activate add-10s
+key enter
+expect text mode "Mode: running"
+expect countdown countdown
+
+sleep 10500
+restart
+
+expect text mode "Mode: elapsed"
+expect text sessions "Sessions: 1"
+expect text countdown "00:00"

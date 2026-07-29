@@ -11,7 +11,7 @@ youth dev
 youth build --release
 ```
 
-## What this app is (Gate C-3)
+## What this app is (Gate C-4)
 
 `Start`, `Pause`, `Resume`, `Cancel`, and `Reset` each perform a real host
 schedule operation through `context.time()` — no clock, tick, or elapsed
@@ -35,16 +35,27 @@ reference the host has already superseded. Idle and Elapsed present a
 literal string instead (the configured duration, or `"00:00"` once
 elapsed), since neither has a live schedule to show.
 
+Recovery is observed, not just reviewed: `tests/overdue_recovery.youth-test`
+starts a real schedule, uses the platform's `sleep` command for a genuine
+wall-clock wait past its deadline, and `restart`s the process — the
+reopened app shows `Mode: elapsed` and an incremented session count
+directly, because mounting a reopened process now drains any backlog of
+already-overdue deliveries before returning its first snapshot. This app's
+`Start` handler has attached a notification descriptor
+(`Notification::new("Youth Timer", "Your timer has elapsed.")`) since Gate
+C-2; the platform now dispatches it as a real, best-effort OS notification
+attempt whenever a schedule elapses, independent of whether the elapsed
+delivery itself succeeds — this repo cannot itself observe a dispatched OS
+notification (`.youth-test` has no hook for that), so that half of the
+evidence is platform-level, not app-repo-level; see `FINDINGS.md`,
+TIMER-F002/F006/F007.
+
 `FINDINGS.md` records what remains open: this repository's own test suite
-can prove declaration, persistence, identity-across-restart, and that the
-`countdown` node is genuinely bound to a live schedule (not a value this
-app resolved or formatted itself) — see `tests/basic.youth-test` and
-`tests/migration_then_start.youth-test` — but cannot itself wait on real
-elapsed time, resolve a live countdown's displayed value, or fire a
-virtual-clock wake, so `ScheduleElapsed` delivery and
-overdue-reconciliation-across-a-closed-process are proven by review and by
-Youth's own workspace tests, not by an end-to-end test from this repo.
-Native notification is Gate D, not yet built.
+still cannot resolve a live countdown's exact displayed value mid-count, or
+inject a mid-turn failure to prove rollback (`test-support` fault
+injection lives in the Youth workspace, not here). Native notification
+*content* review beyond "a descriptor exists and dispatch is attempted" —
+actions, richer payloads, platform-specific behavior — is Gate D.
 
 ## The model
 
@@ -91,7 +102,7 @@ activation (see `FINDINGS.md`, TIMER-F010) — every command independently
 rejects itself when the mode does not allow it, so the app does not rely on
 the UI's presentation as access control.
 
-## Release evidence (Gate C-3)
+## Release evidence (Gate C-4)
 
 These are the metrics this stage can actually produce; see `FINDINGS.md` for
 which of the design's metrics (turn latency, boundary bytes, state-commit
@@ -137,10 +148,12 @@ durable deadline ever existed for it and inventing one would be dishonest.
 Completed-session counts survive. Once migrated, the legacy keys are
 deleted and never reused.
 
-## Gate C-4 and Gate D: not yet built
+## What's still open
 
-Overdue reconciliation across a real closed-process interval, and proving
-elapsed delivery and redelivery end to end from this repo, are Gate C-4.
-Native notification on elapse is Gate D. See `FINDINGS.md`, TIMER-F002,
-TIMER-F007, and TIMER-F006.
+Rollback-injection testing (proving a failure between schedule creation
+and commit leaves no partial state) needs the Youth workspace's
+`test-support` fault-injection feature exercised against a Timer-shaped
+fixture there — this repo alone cannot express it. Richer notification
+behavior (actions, platform-specific payload variants) is Gate D. See
+`FINDINGS.md`, TIMER-F013.
 

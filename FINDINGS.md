@@ -8,14 +8,15 @@ Gate A implemented the Timer domain model and command surface with the
 capabilities Youth had at the time, and recorded what could not be built.
 Gate C-1 versioned and migrated that durable state. Gate C-2 wired
 `Start`/`Pause`/`Resume`/`Cancel`/`Reset` to real host schedules through
-`context.time()`. Gate C-3 adopts host-owned countdown presentation: the
+`context.time()`. Gate C-3 adopted host-owned countdown presentation: the
 `countdown` node is a real `Countdown` bound to the active schedule while
 Running or Paused, retargeted to whatever new schedule identity pausing
 or resuming returns, and a literal string only while Idle or Elapsed.
-Autonomous `ScheduleElapsed` delivery is still unproven from this repo's
-own test suite (see the Gate status section below) — that, and real
-overdue recovery, are Gate C-4 scope. See `README.md` for the current
-state and what remains open.
+Gate C-4 proves recovery end to end: a schedule whose deadline passes
+while this application's process is closed is delivered, not merely
+reconciled, the moment the process reopens — observed from this repo's
+own real-time `.youth-test` suite, not only reviewed. See `README.md`
+for the current state and what remains open.
 
 ## The main result
 
@@ -37,57 +38,56 @@ Not needed:
   - a different persistence API
 ```
 
-## Gate status: Gate C-3 countdown presentation is adopted
+## Gate status: Gate C-4 recovery is proven end to end
 
-- **TIMER-F003, F004, F008, and F011 are closed as application
-  evidence, not just platform capability.** `remaining_seconds` and the
-  guest-invented `generation` are gone from `src/model.rs` entirely;
-  `ScheduleHandle`'s generation is the real value `Schedule::generation()`
-  returns; a durable schedule's ownership never required a live guest
-  instance (Gate B). New this gate: the `countdown` node is a real
-  host-owned `Countdown` bound to the active schedule while Running or
-  Paused, and a literal string only while Idle or Elapsed
-  (`src/app.rs`'s `countdown_content`) — the countdown visibly updates
-  without a guest turn, proven generically at the platform level
-  (`crates/youth-runtime/tests/countdown_presentation.rs` in the Youth
-  workspace) and, in this repo, by `expect countdown` proving the node
-  is genuinely bound to a live schedule reference after `Start`,
-  `Pause`, `Resume`, and a `restart` in either mode — not a value this
-  application recomputed or formatted itself.
-- **TIMER-F001 is closed.** Declarative scheduling (Gate C-2) plus
-  host-owned presentation (this gate) together are exactly what the
-  finding asked for; wording corrected per its 2026-07-25 note to
-  describe the closed capability, not guest clock access.
-- **TIMER-F002 remains partially closed, not fully closed.** `handle_elapsed`
-  now also retargets the display to the literal `"00:00"` on a genuine
-  `ScheduleElapsed` (see `Model::display`), but this repo's own test
-  suite still cannot trigger one: `.youth-test` has no virtual clock and
-  no way to wake a due schedule, so the autonomous path has been
-  reviewed and exercised at the platform level, never end to end from
-  here. This is exactly the gap Gate C-4 is scoped to close (failed
-  elapsed delivery and redelivery are explicitly on its list).
-- **TIMER-F007 stays partially closed**, unchanged from Gate C-2:
-  schedule identity persists and revalidates across restart; overdue
-  reconciliation across a real closed-process interval is still
-  unproven from this repo and is explicitly Gate C-4 scope.
-- **TIMER-F006 is untouched** — notification is Gate D, not this gate.
-- **New: TIMER-F014**, a positive finding — the same semantic node
-  safely retargets between literal and host-derived temporal content
-  across a mode change, with the application never touching schedule
-  rendering mechanics (no display-string formatting for Running/Paused,
-  no resolved-value reading, no clock access anywhere in this crate).
+- **TIMER-F002 and F007 are now closed as application evidence,
+  observed from this repo's own real-time test suite, not merely
+  reviewed.** `tests/overdue_recovery.youth-test` starts a real 10-second
+  schedule, uses the platform's new `.youth-test` `sleep` command for a
+  genuine wall-clock wait past its deadline (no virtual clock — the
+  real-headless runner already defaults to real system time), then
+  `restart`s the process and observes the result directly: `Mode:
+  elapsed`, `Sessions: 1`, and the countdown retargeted back to the
+  literal `"00:00"` — all without this application ever being told to
+  advance, poll, or check anything itself. This closed a real platform
+  gap discovered while building this test, not just an app-repo one:
+  mounting a reopened `YouthAppHandle` previously only *reconciled* an
+  overdue schedule (queuing its delivery, per the design's "due
+  detection does not require a guest" rule) but nothing ever actually
+  *delivered* it — not this app's test suite, not the desktop app, not
+  the CLI. The Youth workspace's worker now drains any such backlog the
+  moment a reopened app mounts, which is what makes this test able to
+  observe `Mode: elapsed` at all rather than a `Mode: running` that
+  silently never updates.
+- **TIMER-F006 is closed as application evidence.** `src/app.rs`'s
+  `Start` handler has attached a notification descriptor
+  (`Notification::new("Youth Timer", "Your timer has elapsed.")`) to
+  its `schedule_after` call since Gate C-2, unchanged by this gate; the
+  platform now actually dispatches it — a real OS notification attempt,
+  independent of whether the elapsed delivery itself succeeds — proven
+  at the platform level (`crates/youth-runtime/tests/notification_dispatch.rs`).
+  This repo cannot itself observe a dispatched OS notification (`.youth-test`
+  has no hook for it, by design — the same reason it cannot resolve a
+  live countdown value), so this closure rests on code review of this
+  app's own descriptor plus the platform's exactly-once dispatch
+  evidence, not a Timer-repo-owned runtime assertion; recorded honestly
+  as such.
+- **TIMER-F003, F004, F008, and F011 remain closed**, unchanged from
+  Gate C-3/C-2/B.
+- **TIMER-F001 remains closed**, unchanged from Gate C-3.
+- **TIMER-F014 remains closed**, unchanged from Gate C-3.
 
 ## Open findings
 
 | ID | Summary | Next decision |
 | --- | --- | --- |
 | TIMER-F001 | *(closed, C-2/C-3)* Declarative scheduling plus host-owned countdown presentation are both wired and observed | None; closed |
-| TIMER-F002 | *(partially closed, C-2/C-3)* `handle_elapsed` reacts to `ScheduleElapsed` and retargets display to `"00:00"`, but no test in this repo has ever driven a real delivery through it | Gate C-4: prove elapsed delivery and redelivery end to end |
+| TIMER-F002 | *(closed, C-4)* `handle_elapsed` fires for real: overdue recovery observed end to end via `tests/overdue_recovery.youth-test` | None; closed |
 | TIMER-F003 | *(closed, C-1/C-2)* `remaining_seconds` deleted; the host owns it entirely | None; closed |
 | TIMER-F004 | *(closed, C-3)* The `countdown` node is a real `Countdown` while Running/Paused; it visibly updates without a guest turn | None; closed |
 | TIMER-F005 | Incremental `handle` updates can silently diverge from a fresh `view` | Materially strengthens CALC-F009; justifies building a `--verify-view-convergence` test mode (design recorded below), not yet SDK diffing/reactive dependencies |
-| TIMER-F006 | No native notification effect on elapse | Decision recorded: attach a bounded notification descriptor to the schedule, not a general effects API |
-| TIMER-F007 | *(partially closed, C-2)* `restart` now proves the schedule identity itself persists and revalidates, not just app state | Gate C-4: overdue reconciliation across a real closed-process interval |
+| TIMER-F006 | *(closed, C-4)* Platform now dispatches this app's already-declared notification descriptor | None; closed |
+| TIMER-F007 | *(closed, C-4)* `restart` proves identity persistence (C-2) and overdue recovery across a real closed interval (C-4), both observed | None; closed |
 | TIMER-F008 | *(closed, C-2)* `ScheduleHandle`'s generation is the real host-issued value; `completed_sessions` stays a separate application counter | None; closed |
 | TIMER-F014 | *(positive finding, C-3)* The same semantic node safely retargets between literal and host-derived content across a mode change | None; closed |
 
@@ -96,16 +96,16 @@ Not needed:
 | ID | Summary | Status | Primary implication |
 | --- | --- | --- | --- |
 | TIMER-F001 | Declarative scheduling and host-owned presentation, both wired | Addressed (C-2/C-3) | Timer's `view`/`handle` never format a live countdown or a deadline themselves |
-| TIMER-F002 | `handle_elapsed` exists and retargets display, but is untested end to end | Partially addressed (C-2/C-3) | Needs a virtual-clock test path this repo does not have; Gate C-4 scope |
+| TIMER-F002 | `handle_elapsed` fires for real, observed via a real reopened process | Addressed (C-4) | `tests/overdue_recovery.youth-test` proves autonomous elapse end to end |
 | TIMER-F003 | Guest no longer persists remaining duration | Addressed (C-1/C-2) | `remaining_seconds` deleted entirely |
 | TIMER-F004 | Countdown self-updates without a guest turn | Addressed (C-3) | `countdown_content` binds a real `Countdown` node while Running/Paused |
 | TIMER-F005 | Incremental `handle` updates can silently diverge from a fresh `view` | Addressed in this app; platform risk remains open (tracked by youth's CALC-F009) | Turns theoretical CALC-F009 risk into a reproduced bug; justifies a convergence-checker test mode |
-| TIMER-F006 | No native notification effect | Open (design decision recorded) | Elapse cannot alert the user outside the window; recommend schedule-attached notification descriptor |
-| TIMER-F007 | Schedule identity persists and revalidates across restart | Partially addressed (C-2) | Overdue reconciliation across a real closed interval remains unproven here; Gate C-4 scope |
+| TIMER-F006 | Platform dispatches this app's already-declared notification descriptor | Addressed (C-4, evidence split between this app's declaration and the platform's dispatch) | Elapse now attempts a real OS notification, independent of delivery success |
+| TIMER-F007 | Schedule identity persists and revalidates across restart; overdue recovery across a real closed interval is now observed | Addressed (C-2/C-4) | `tests/overdue_recovery.youth-test` is the closing evidence |
 | TIMER-F008 | Schedule generation is host-issued in the running application | Addressed (C-2) | `ScheduleHandle` mirrors the real `Schedule.generation()` value |
 | TIMER-F009 | Mode machine, bounded configuration, sessions, commands, and shortcuts are fully expressible today | Addressed (positive boundary confirmation) | The non-temporal design surface needs no new protocol — see "The main result" above |
 | TIMER-F010 | The host does not enforce a button's `enabled` flag on activation; it is presentation only | Addressed (boundary confirmation) | The guest must self-guard every command; test DSL naming (`activate` vs. a future `click`) recorded |
-| TIMER-F013 | The `.youth-test` DSL can seed durable state and (as of this gate) assert a node's temporal content kind, but still cannot wait on real time, resolve a live display value, fire a virtual-clock wake, or inject a mid-turn failure | Partially addressed | Migration and content-kind retargeting are integration-tested; elapsed-delivery and rollback-injection testing remain the open corollary |
+| TIMER-F013 | The `.youth-test` DSL can seed durable state, assert a node's temporal content kind, and (as of Gate C-4) genuinely wait on real time via `sleep` — but still cannot resolve a live countdown's exact displayed value mid-count, or inject a mid-turn failure | Partially addressed | Migration, content-kind retargeting, and real-time elapsed delivery are all integration-tested now; rollback-injection testing remains the open corollary |
 | TIMER-F012 | An application cannot migrate its own durable state at load time; `view` is read-only | Open | Migration must defer to the first event turn, so legacy interpretation can never be retired on the app's own schedule |
 | TIMER-F011 | Schedule ownership across app unloading is undefined | Addressed (Gate B) | The host owns schedule existence, due detection, and pending delivery; the guest owns only its transactional reaction |
 | TIMER-F014 | A semantic node safely retargets between literal and host-derived temporal content | Addressed (positive boundary confirmation) | The application declares which schedule and format apply; it never renders, diffs, or formats the resolved value itself |
